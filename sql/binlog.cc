@@ -4090,43 +4090,43 @@ enum enum_read_gtids_from_binlog_status {
   ERROR,
   TRUNCATED
 };
-/**
-  Reads GTIDs from the given binlog file.
 
-  @param filename File to read from.
-  @param all_gtids If not NULL, then the GTIDs from the
-  Previous_gtids_log_event and from all Gtid_log_events are stored in
-  this object.
-  @param prev_gtids If not NULL, then the GTIDs from the
-  Previous_gtids_log_events are stored in this object.
-  @param first_gtid If not NULL, then the first GTID information from the
-  file will be stored in this object.
-  @param sid_map The sid_map object to use in the rpl_sidno generation
-  of the Gtid_log_event. If lock is needed in the sid_map, the caller
-  must hold it.
-  @param verify_checksum Set to true to verify event checksums.
-  @param is_relay_log Set to true, if filename is a Relay Log, false if it is a
-  Binary Log.
-  @retval GOT_GTIDS The file was successfully read and it contains
+/**
+ * 从给定的 binlog 中读 GTIDs
+ * @param[in] filename 待读的文件名
+ * @param[out] all_gtids 返回 Previous_gtids_log_event 和所有 Gtid_log_events 的并集
+ * @param[out] prev_gtids 返回 Previous_gtids_log_events 中的 GTIDs
+ * @param[out] first_gtid 返回该文件的第一个 GTID info
+ * @param[in] sid_map 在 Gtid_log_event 的 rpl_sidno 生成中使用的 sid_map 对象。
+ * 					  如果在 sid_map 中需要锁，则调用者必须拥有它。
+ * @param[in] verify_checksum 设置为 true 时会校验 checksum
+ * @param[in] is_relay_log filename 对应的是 relay log 时为 true，
+ * 						   filename 对应的是 binlog 时 为 false
+ * 
+ * @retval GOT_GTIDS The file was successfully read and it contains
   both Gtid_log_events and Previous_gtids_log_events.
   This is only possible if either all_gtids or first_gtid are not null.
-  @retval GOT_PREVIOUS_GTIDS The file was successfully read and it
+ * @retval GOT_PREVIOUS_GTIDS The file was successfully read and it
   contains Previous_gtids_log_events but no Gtid_log_events.
   For binary logs, if no all_gtids and no first_gtid are specified,
   this function will be done right after reading the PREVIOUS_GTIDS
   regardless of the rest of the content of the binary log file.
-  @retval NO_GTIDS The file was successfully read and it does not
+ * @retval NO_GTIDS The file was successfully read and it does not
   contain GTID events.
-  @retval ERROR Out of memory, or IO error, or malformed event
+ * @retval ERROR Out of memory, or IO error, or malformed event
   structure, or the file is malformed (e.g., contains Gtid_log_events
   but no Previous_gtids_log_event).
-  @retval TRUNCATED The file was truncated before the end of the
+ * @retval TRUNCATED The file was truncated before the end of the
   first Previous_gtids_log_event.
 */
-static enum_read_gtids_from_binlog_status read_gtids_from_binlog(
-    const char *filename, Gtid_set *all_gtids, Gtid_set *prev_gtids,
-    Gtid *first_gtid, Sid_map *sid_map, bool verify_checksum,
-    bool is_relay_log) {
+static enum_read_gtids_from_binlog_status read_gtids_from_binlog(const char *filename,
+																 Gtid_set *all_gtids,
+																 Gtid_set *prev_gtids,
+																 Gtid *first_gtid,
+																 Sid_map *sid_map,
+																 bool verify_checksum,
+																 bool is_relay_log)
+{
   DBUG_TRACE;
   DBUG_PRINT("info", ("Opening file %s", filename));
 
@@ -4336,102 +4336,127 @@ static enum_read_gtids_from_binlog_status read_gtids_from_binlog(
   return ret;
 }
 
-bool MYSQL_BIN_LOG::find_first_log_not_in_gtid_set(char *binlog_file_name,
-                                                   const Gtid_set *gtid_set,
-                                                   Gtid *first_gtid,
-                                                   const char **errmsg) {
-  DBUG_TRACE;
-  LOG_INFO linfo;
-  auto log_index = this->get_log_index();
-  std::list<std::string> filename_list = log_index.second;
-  int error = log_index.first;
-  list<string>::reverse_iterator rit;
-  Gtid_set binlog_previous_gtid_set{gtid_set->get_sid_map()};
+/**
+ * 查找包含不在传入的 gtid_set 中的任何 binlog event 的最旧的 binlog file
+ * @param[out] binlog_file_name 找到的最旧的 binlog file
+ * @param[in]  gtid_set slave 的 executed gtid set
+ * @param[out] first_gtid binlog_file_name 对应的 binlog 中的第一个 GTID 信息
+ * @param[out] errmsg
+ * @return 成功时返回 false，否则返回 true
+ */
+bool MYSQL_BIN_LOG::find_first_log_not_in_gtid_set(char* binlog_file_name,
+                                                   const Gtid_set* gtid_set,
+                                                   Gtid* first_gtid,
+                                                   const char** errmsg)
+{
+	DBUG_TRACE;
+	LOG_INFO linfo;
 
-  if (error != LOG_INFO_EOF) {
-    *errmsg =
-        "Failed to read the binary log index file while "
-        "looking for the oldest binary log that contains any GTID "
-        "that is not in the given gtid set";
-    error = -1;
-    goto end;
-  }
+	auto log_index = this->get_log_index();
+	std::list<std::string> filename_list = log_index.second;
+	int error = log_index.first;
 
-  if (filename_list.empty()) {
-    *errmsg =
-        "Could not find first log file name in binary log index file "
-        "while looking for the oldest binary log that contains any GTID "
-        "that is not in the given gtid set";
-    error = -2;
-    goto end;
-  }
+	list<string>::reverse_iterator rit;
+	Gtid_set binlog_previous_gtid_set{gtid_set->get_sid_map()};
 
-  /*
-    Iterate over all the binary logs in reverse order, and read only
-    the Previous_gtids_log_event, to find the first one, that is the
-    subset of the given gtid set. Since every binary log begins with
-    a Previous_gtids_log_event, that contains all GTIDs in all
-    previous binary logs.
-    We also ask for the first GTID in the binary log to know if we
-    should send the FD event with the "created" field cleared or not.
-  */
-  DBUG_PRINT("info", ("Iterating backwards through binary logs, and reading "
-                      "only the Previous_gtids_log_event, to find the first "
-                      "one, that is the subset of the given gtid set."));
-  rit = filename_list.rbegin();
-  error = 0;
-  while (rit != filename_list.rend()) {
-    binlog_previous_gtid_set.clear();
-    const char *filename = rit->c_str();
-    DBUG_PRINT("info",
-               ("Read Previous_gtids_log_event from filename='%s'", filename));
-    switch (read_gtids_from_binlog(filename, nullptr, &binlog_previous_gtid_set,
-                                   first_gtid,
-                                   binlog_previous_gtid_set.get_sid_map(),
-                                   opt_source_verify_checksum, is_relay_log)) {
-      case ERROR:
-        *errmsg =
-            "Error reading header of binary log while looking for "
-            "the oldest binary log that contains any GTID that is not in "
-            "the given gtid set";
-        error = -3;
-        goto end;
-      case NO_GTIDS:
-        *errmsg =
-            "Found old binary log without GTIDs while looking for "
-            "the oldest binary log that contains any GTID that is not in "
-            "the given gtid set";
-        error = -4;
-        goto end;
-      case GOT_GTIDS:
-      case GOT_PREVIOUS_GTIDS:
-        if (binlog_previous_gtid_set.is_subset(gtid_set)) {
-          strcpy(binlog_file_name, filename);
-          /*
-            Verify that the selected binlog is not the first binlog,
-          */
-          DBUG_EXECUTE_IF("replica_reconnect_with_gtid_set_executed",
-                          assert(strcmp(filename_list.begin()->c_str(),
-                                        binlog_file_name) != 0););
-          goto end;
-        }
-      case TRUNCATED:
-        break;
-    }
+	// get_log_index 中 fail 了
+	if (error != LOG_INFO_EOF)
+	{
+		*errmsg =
+			"Failed to read the binary log index file while "
+			"looking for the oldest binary log that contains any GTID "
+			"that is not in the given gtid set";
+		error = -1;
+		goto end;
+	}
 
-    rit++;
-  }
+	if (filename_list.empty())
+	{
+		*errmsg =
+			"Could not find first log file name in binary log index file "
+			"while looking for the oldest binary log that contains any GTID "
+			"that is not in the given gtid set";
+		error = -2;
+		goto end;
+	}
 
-  if (rit == filename_list.rend()) {
-    report_missing_gtids(&binlog_previous_gtid_set, gtid_set, errmsg);
-    error = -5;
-  }
+
+	/*
+		反向遍历所有的 binlog，只读取 Previous_gtids_log_event，以找到第一个传入 gtid set 的子集。
+		每个 binlog 都是以一个 Previous_gtids_log_event 开始，
+		这个 event 中包含了前一个 binlog 的所有的 GTIDs
+
+		我们还需要 binlog 中的第一个 GTID，以判断我们是否应该在清除了 "created" 字段的情况下发送 FD event。
+		（FD event是啥？？？）
+	*/
+	DBUG_PRINT("info", ("Iterating backwards through binary logs, and reading "
+						"only the Previous_gtids_log_event, to find the first "
+						"one, that is the subset of the given gtid set."));
+	rit = filename_list.rbegin();
+	error = 0;
+	while (rit != filename_list.rend())
+	{
+		binlog_previous_gtid_set.clear();
+		const char *filename = rit->c_str();
+		DBUG_PRINT("info",
+				("Read Previous_gtids_log_event from filename='%s'", filename));
+		switch (read_gtids_from_binlog(filename,
+									   nullptr,
+									   &binlog_previous_gtid_set,
+									   first_gtid,
+								  	   binlog_previous_gtid_set.get_sid_map(),
+									   opt_master_verify_checksum,
+									   is_relay_log))
+		{
+			case ERROR:
+				*errmsg =
+					"Error reading header of binary log while looking for "
+					"the oldest binary log that contains any GTID that is not in "
+					"the given gtid set";
+				error = -3;
+				goto end;
+			case NO_GTIDS:
+				*errmsg =
+					"Found old binary log without GTIDs while looking for "
+					"the oldest binary log that contains any GTID that is not in "
+					"the given gtid set";
+				error = -4;
+				goto end;
+			case GOT_GTIDS:
+			case GOT_PREVIOUS_GTIDS:
+				// 看上一个 binlog 的 gtid set 是否是传入的 gtid_set 的子集
+				// 如果是的话则吧当前 binlog filename 拷贝到出参 binlog_file_name 并退出
+				// 因为是逆序查找，所以第一个 previous_gtid_set 是 slave executed 的子集则意味着：
+				// 当前的 binlog file 有一部分在 slave 中没有
+				if (binlog_previous_gtid_set.is_subset(gtid_set))
+				{
+					strcpy(binlog_file_name, filename);
+					/*
+						Verify that the selected binlog is not the first binlog,
+					*/
+					DBUG_EXECUTE_IF("slave_reconnect_with_gtid_set_executed",
+									assert(strcmp(filename_list.begin()->c_str(),
+													binlog_file_name) != 0););
+					goto end;
+				}
+			case TRUNCATED:
+				break;
+		}
+
+		rit++;
+	}
+
+	if (rit == filename_list.rend())
+	{
+		report_missing_gtids(&binlog_previous_gtid_set, gtid_set, errmsg);
+		error = -5;
+	}
 
 end:
-  if (error) DBUG_PRINT("error", ("'%s'", *errmsg));
-  filename_list.clear();
-  DBUG_PRINT("info", ("returning %d", error));
-  return error != 0 ? true : false;
+	if (error) DBUG_PRINT("error", ("'%s'", *errmsg));
+	filename_list.clear();
+	DBUG_PRINT("info", ("returning %d", error));
+	return error != 0 ? true : false;
 }
 
 bool MYSQL_BIN_LOG::init_gtid_sets(Gtid_set *all_gtids, Gtid_set *lost_gtids,
@@ -5462,28 +5487,37 @@ int MYSQL_BIN_LOG::find_next_relay_log(char log_name[FN_REFLEN + 1]) {
   return error;
 }
 
-std::pair<int, std::list<std::string>> MYSQL_BIN_LOG::get_log_index(
-    bool need_lock_index) {
-  DBUG_TRACE;
-  LOG_INFO log_info;
+/**
+ * 检索与此 log object 相关的索引文件，存入到一个 std::list<std::string>
+ * 索引文件的顺序会被保留。
+ * @param need_lock_index 是否应该在函数内部对 index 文件加锁
+ * @return
+ * 		- first: 函数的状态码
+ * 		- second：包含 log index 的 std::list<std::string>
+ */
+std::pair<int, std::list<std::string>>
+MYSQL_BIN_LOG::get_log_index(bool need_lock_index)
+{
+	DBUG_TRACE;
+	LOG_INFO log_info;
 
-  if (need_lock_index)
-    mysql_mutex_lock(&LOCK_index);
-  else
-    mysql_mutex_assert_owner(&LOCK_index);
+	if (need_lock_index)
+		mysql_mutex_lock(&LOCK_index);
+	else
+		mysql_mutex_assert_owner(&LOCK_index);
 
-  std::list<std::string> filename_list;
-  int error = 0;
-  for (error =
-           this->find_log_pos(&log_info, nullptr, false /*need_lock_index*/);
-       error == 0;
-       error = this->find_next_log(&log_info, false /*need_lock_index*/)) {
-    filename_list.push_back(std::string(log_info.log_file_name));
-  }
+	std::list<std::string> filename_list;
+	int error = 0;
+	for (error = this->find_log_pos(&log_info, nullptr, false /*need_lock_index*/);
+		error == 0;
+		error = this->find_next_log(&log_info, false /*need_lock_index*/))
+	{
+		filename_list.push_back(std::string(log_info.log_file_name));
+	}
 
-  if (need_lock_index) mysql_mutex_unlock(&LOCK_index);
+	if (need_lock_index) mysql_mutex_unlock(&LOCK_index);
 
-  return std::make_pair(error, filename_list);
+	return std::make_pair(error, filename_list);
 }
 
 /**

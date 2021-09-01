@@ -740,21 +740,23 @@ rpl_gno Gtid_set::get_last_gno(rpl_sidno sidno) const {
 }
 
 long Gtid_set::to_string(char **buf_arg, bool need_lock,
-                         const Gtid_set::String_format *sf_arg) const {
-  DBUG_TRACE;
-  if (sid_lock != nullptr) {
-    if (need_lock)
-      sid_lock->wrlock();
-    else
-      sid_lock->assert_some_wrlock();
-  }
-  size_t len = get_string_length(sf_arg);
-  *buf_arg =
-      (char *)my_malloc(key_memory_Gtid_set_to_string, len + 1, MYF(MY_WME));
-  if (*buf_arg == nullptr) return -1;
-  to_string(*buf_arg, false /*need_lock*/, sf_arg);
-  if (sid_lock != nullptr && need_lock) sid_lock->unlock();
-  return len;
+                         const Gtid_set::String_format *sf_arg) const
+{
+	DBUG_TRACE;
+	if (sid_lock != nullptr)
+	{
+		if (need_lock)
+		sid_lock->wrlock();
+		else
+		sid_lock->assert_some_wrlock();
+	}
+	size_t len = get_string_length(sf_arg);
+	*buf_arg =
+		(char *)my_malloc(key_memory_Gtid_set_to_string, len + 1, MYF(MY_WME));
+	if (*buf_arg == nullptr) return -1;
+	to_string(*buf_arg, false /*need_lock*/, sf_arg);
+	if (sid_lock != nullptr && need_lock) sid_lock->unlock();
+	return len;
 }
 
 size_t Gtid_set::to_string(char *buf, bool need_lock,
@@ -986,124 +988,149 @@ bool Gtid_set::equals(const Gtid_set *other) const {
 }
 
 bool Gtid_set::is_interval_subset(Const_interval_iterator *sub,
-                                  Const_interval_iterator *super) {
-  DBUG_TRACE;
-  // check if all intervals for this sidno are contained in some
-  // interval of super
-  const Interval *super_iv = super->get();
-  const Interval *sub_iv = sub->get();
+                                  Const_interval_iterator *super)
+{
+	DBUG_TRACE;
+	// check if all intervals for this sidno are contained in some
+	// interval of super
+	const Interval *super_iv = super->get();
+	const Interval *sub_iv = sub->get();
 
-  /*
-    Algorithm: Let sub_iv iterate over intervals of sub.  For each
-    sub_iv, skip over intervals of super that end before sub_iv.  When we
-    find the first super-interval that does not end before sub_iv,
-    check if it covers sub_iv.
-  */
-  do {
-    if (super_iv == nullptr) return false;
+	/*
+		Algorithm: Let sub_iv iterate over intervals of sub.  For each
+		sub_iv, skip over intervals of super that end before sub_iv.  When we
+		find the first super-interval that does not end before sub_iv,
+		check if it covers sub_iv.
+	*/
+	do {
+		if (super_iv == nullptr) return false;
 
-    // Skip over 'smaller' intervals of super.
-    while (sub_iv->start > super_iv->end) {
-      super->next();
-      super_iv = super->get();
-      // If we reach end of super, then no interal covers sub_iv, so
-      // sub is not a subset of super.
-      if (super_iv == nullptr) return false;
-    }
+		// Skip over 'smaller' intervals of super.
+		while (sub_iv->start > super_iv->end) {
+			super->next();
+			super_iv = super->get();
+			// If we reach end of super, then no interal covers sub_iv, so
+			// sub is not a subset of super.
+			if (super_iv == nullptr) return false;
+		}
 
-    // If super_iv does not cover sub_iv, then sub is not a subset of
-    // super.
-    if (sub_iv->start < super_iv->start || sub_iv->end > super_iv->end)
-      return false;
+		// If super_iv does not cover sub_iv, then sub is not a subset of
+		// super.
+		if (sub_iv->start < super_iv->start || sub_iv->end > super_iv->end)
+			return false;
 
-    // Next iteration.
-    sub->next();
-    sub_iv = sub->get();
+		// Next iteration.
+		sub->next();
+		sub_iv = sub->get();
 
-  } while (sub_iv != nullptr);
+	} while (sub_iv != nullptr);
 
-  // If every GNO in sub also exists in super, then it was a subset.
-  return true;
+	// If every GNO in sub also exists in super, then it was a subset.
+	return true;
 }
 
+/**
+ * 如果当前的 gtid_set 实例是对于传入的 superset_sidno 和 subset_sidno 上
+ * 对于传入的 gtid_set 的一个子集，则返回 True
+ * @param super，this->gtid_set 需要进行比较的 Gtid_set
+ * @param superset_sidno，相对于 super->sid_map，将要被比较的 sidno。
+ * @param subset_sidno，相对于 super->sid_map，将要被比较的 sidno
+ * @return true，当 this->gtid 是传入的 super gtid 的子集
+ */
 bool Gtid_set::is_subset_for_sid(const Gtid_set *super,
                                  rpl_sidno superset_sidno,
-                                 rpl_sidno subset_sidno) const {
-  DBUG_TRACE;
-  /*
-    The following assert code is to see that caller acquired
-    either write or read lock on global_sid_lock.
-    Note that if it is read lock, then it should also
-    acquire lock on sidno.
-    i.e., the caller must acquire lock either A1 way or A2 way.
-        A1. global_sid_lock.wrlock()
-        A2. global_sid_lock.rdlock(); gtid_state.lock_sidno(sidno)
-  */
-  if (sid_lock != nullptr) super->sid_lock->assert_some_lock();
-  if (super->sid_lock != nullptr) super->sid_lock->assert_some_lock();
-  /*
-    If subset(i.e, this object) does not have required sid in it, i.e.,
-    subset_sidno is zero, then it means it is subset of any given
-    super set. Hence return true.
-  */
-  if (subset_sidno == 0) return true;
-  /*
-    If superset (i.e., the passed gtid_set) does not have given sid in it,
-    i.e., superset_sidno is zero, then it means it cannot be superset
-    to any given subset. Hence return false.
-  */
-  if (superset_sidno == 0) return false;
-  /*
-    Once we have valid(non-zero) subset's and superset's sid numbers, call
-    is_interval_subset().
-  */
-  Const_interval_iterator subset_ivit(this, subset_sidno);
-  Const_interval_iterator superset_ivit(super, superset_sidno);
-  if (!is_interval_subset(&subset_ivit, &superset_ivit)) return false;
+                                 rpl_sidno subset_sidno) const
+{
+	DBUG_TRACE;
+	/*
+		The following assert code is to see that caller acquired
+		either write or read lock on global_sid_lock.
+		Note that if it is read lock, then it should also
+		acquire lock on sidno.
+		i.e., the caller must acquire lock either A1 way or A2 way.
+			A1. global_sid_lock.wrlock()
+			A2. global_sid_lock.rdlock(); gtid_state.lock_sidno(sidno)
+	*/
+	if (sid_lock != nullptr) super->sid_lock->assert_some_lock();
+	if (super->sid_lock != nullptr) super->sid_lock->assert_some_lock();
 
-  return true;
+	/*
+		If subset(i.e, this object) does not have required sid in it, i.e.,
+		subset_sidno is zero, then it means it is subset of any given
+		super set. Hence return true.
+	*/
+	// 如果 subset（即 this）中没有当前 master 的 sid，那么就意味着它是任何给定的 super set 的子集
+	if (subset_sidno == 0) return true;
+
+	/*
+		If superset (i.e., the passed gtid_set) does not have given sid in it,
+		i.e., superset_sidno is zero, then it means it cannot be superset
+		to any given subset. Hence return false.
+	*/
+	// 如果 superset（即传入的 gtid_set）中没有 sid，那么意味着它不会是任何给定子集的超集
+	if (superset_sidno == 0) return false;
+	/*
+		Once we have valid(non-zero) subset's and superset's sid numbers, call
+		is_interval_subset().
+	*/
+
+
+	Const_interval_iterator subset_ivit(this, subset_sidno);
+	Const_interval_iterator superset_ivit(super, superset_sidno);
+	if (!is_interval_subset(&subset_ivit, &superset_ivit)) return false;
+
+	return true;
 }
 
-bool Gtid_set::is_subset(const Gtid_set *super) const {
-  DBUG_TRACE;
-  if (sid_lock != nullptr) sid_lock->assert_some_wrlock();
-  if (super->sid_lock != nullptr) super->sid_lock->assert_some_wrlock();
+// 如果当前 gtid_set 是传入 gtid_set 的一个子集时返回 true
+bool Gtid_set::is_subset(const Gtid_set *super) const
+{
+	DBUG_TRACE;
+	if (sid_lock != nullptr) sid_lock->assert_some_wrlock();
+	if (super->sid_lock != nullptr) super->sid_lock->assert_some_wrlock();
 
-  Sid_map *super_sid_map = super->sid_map;
-  rpl_sidno max_sidno = get_max_sidno();
-  rpl_sidno super_max_sidno = super->get_max_sidno();
+	Sid_map *super_sid_map = super->sid_map;
+	rpl_sidno max_sidno = get_max_sidno();
+	rpl_sidno super_max_sidno = super->get_max_sidno();
 
-  /*
-    Iterate over sidnos of this Gtid_set where there is at least one
-    interval.  For each such sidno, get the corresponding sidno of
-    super, and then use is_interval_subset to look for GTIDs that
-    exist in this but not in super.
-  */
-  for (int sidno = 1; sidno <= max_sidno; sidno++) {
-    Const_interval_iterator ivit(this, sidno);
-    const Interval *iv = ivit.get();
-    if (iv != nullptr) {
-      // Get the corresponding super_sidno
-      int super_sidno;
-      if (super_sid_map == sid_map || super_sid_map == nullptr ||
-          sid_map == nullptr)
-        super_sidno = sidno;
-      else {
-        super_sidno = super_sid_map->sid_to_sidno(sid_map->sidno_to_sid(sidno));
-        if (super_sidno == 0) return false;
-      }
-      if (super_sidno > super_max_sidno) return false;
+	/*
+		Iterate over sidnos of this Gtid_set where there is at least one
+		interval.  For each such sidno, get the corresponding sidno of
+		super, and then use is_interval_subset to look for GTIDs that
+		exist in this but not in super.
+	*/
+	for (int sidno = 1; sidno <= max_sidno; sidno++)
+	{
+		Const_interval_iterator ivit(this, sidno);
+		const Interval *iv = ivit.get();
+		if (iv != nullptr)
+		{
+			// Get the corresponding super_sidno
+			int super_sidno;
+			if (super_sid_map == sid_map
+				|| super_sid_map == nullptr
+				|| sid_map == nullptr)
+			{
+				super_sidno = sidno;
+			}
+			else
+			{
+				super_sidno = super_sid_map->sid_to_sidno(sid_map->sidno_to_sid(sidno));
+				if (super_sidno == 0) return false;
+			}
 
-      // Check if all GNOs in this Gtid_set for sidno exist in other
-      // Gtid_set for super_
-      Const_interval_iterator super_ivit(super, super_sidno);
-      if (!is_interval_subset(&ivit, &super_ivit)) return false;
-    }
-  }
+			if (super_sidno > super_max_sidno) return false;
 
-  // If the GNOs for every SIDNO of sub existed in super, then it was
-  // a subset.
-  return true;
+			// Check if all GNOs in this Gtid_set for sidno exist in other
+			// Gtid_set for super_
+			Const_interval_iterator super_ivit(super, super_sidno);
+			if (!is_interval_subset(&ivit, &super_ivit)) return false;
+		}
+  	}
+
+	// If the GNOs for every SIDNO of sub existed in super, then it was
+	// a subset.
+	return true;
 }
 
 bool Gtid_set::is_interval_intersection_nonempty(
@@ -1283,87 +1310,97 @@ void Gtid_set::encode(uchar *buf) const {
 
 enum_return_status Gtid_set::add_gtid_encoding(const uchar *encoded,
                                                size_t length,
-                                               size_t *actual_length) {
-  DBUG_TRACE;
-  if (sid_lock != nullptr) sid_lock->assert_some_wrlock();
-  size_t pos = 0;
-  uint64 n_sids;
-  Free_intervals_lock lock(this);
-  // read number of SIDs
-  if (length < 8) {
-    DBUG_PRINT("error", ("(length=%lu) < 8", (ulong)length));
-    goto report_error;
-  }
-  n_sids = uint8korr(encoded);
-  pos += 8;
-  // iterate over SIDs
-  for (uint sid_counter = 0; sid_counter < n_sids; sid_counter++) {
-    // read SID and number of intervals
-    if (length - pos < 16 + 8) {
-      DBUG_PRINT("error", ("(length=%lu) - (pos=%lu) < 16 + 8. "
-                           "[n_sids=%" PRIu64 " i=%u]",
-                           (ulong)length, (ulong)pos, n_sids, sid_counter));
-      goto report_error;
-    }
-    rpl_sid sid;
-    sid.copy_from(encoded + pos);
-    pos += 16;
-    uint64 n_intervals = uint8korr(encoded + pos);
-    pos += 8;
-    rpl_sidno sidno = sid_map->add_sid(sid);
-    if (sidno < 0) {
-      DBUG_PRINT("error", ("sidno=%d", sidno));
-      RETURN_REPORTED_ERROR;
-    }
-    PROPAGATE_REPORTED_ERROR(ensure_sidno(sidno));
-    // iterate over intervals
-    if (length - pos < 2 * 8 * n_intervals) {
-      DBUG_PRINT(
-          "error",
-          ("(length=%lu) - (pos=%lu) < 2 * 8 * (n_intervals=%" PRIu64 ")",
-           (ulong)length, (ulong)pos, n_intervals));
-      goto report_error;
-    }
-    Interval_iterator ivit(this, sidno);
-    rpl_gno last = 0;
-    for (uint i = 0; i < n_intervals; i++) {
-      // read one interval
-      rpl_gno start = sint8korr(encoded + pos);
-      pos += 8;
-      rpl_gno end = sint8korr(encoded + pos);
-      pos += 8;
-      if (start <= last || end <= start) {
-        DBUG_PRINT("error", ("last=%" PRId64 " start=%" PRId64 " end=%" PRId64,
-                             last, start, end));
-        goto report_error;
-      }
-      last = end;
-      // Add interval.  Use the existing iterator position if the
-      // current interval does not begin before it.  Otherwise iterate
-      // from the beginning.
-      Interval *current = ivit.get();
-      if (current == nullptr || start < current->start) ivit.init(this, sidno);
-      DBUG_PRINT("info",
-                 ("adding %d:%" PRId64 "-%" PRId64, sidno, start, end - 1));
-      add_gno_interval(&ivit, start, end, &lock);
-    }
-  }
-  assert(pos <= length);
-  if (actual_length == nullptr) {
-    if (pos != length) {
-      DBUG_PRINT("error",
-                 ("(pos=%lu) != (length=%lu)", (ulong)pos, (ulong)length));
-      goto report_error;
-    }
-  } else
-    *actual_length = pos;
+                                               size_t *actual_length)
+{
+	DBUG_TRACE;
+	if (sid_lock != nullptr) sid_lock->assert_some_wrlock();
+	size_t pos = 0;
+	uint64 n_sids;
+	Free_intervals_lock lock(this);
+	// read number of SIDs
+	if (length < 8)
+	{
+		DBUG_PRINT("error", ("(length=%lu) < 8", (ulong)length));
+		goto report_error;
+	}
+	n_sids = uint8korr(encoded);
+	pos += 8;
+	// iterate over SIDs
+	for (uint sid_counter = 0; sid_counter < n_sids; sid_counter++)
+	{
+		// read SID and number of intervals
+		if (length - pos < 16 + 8)
+		{
+			DBUG_PRINT("error", ("(length=%lu) - (pos=%lu) < 16 + 8. "
+								"[n_sids=%" PRIu64 " i=%u]",
+								(ulong)length, (ulong)pos, n_sids, sid_counter));
+			goto report_error;
+		}
+		rpl_sid sid;
+		sid.copy_from(encoded + pos);
+		pos += 16;
+		uint64 n_intervals = uint8korr(encoded + pos);
+		pos += 8;
+		rpl_sidno sidno = sid_map->add_sid(sid);
+		if (sidno < 0)
+		{
+			DBUG_PRINT("error", ("sidno=%d", sidno));
+			RETURN_REPORTED_ERROR;
+		}
+		PROPAGATE_REPORTED_ERROR(ensure_sidno(sidno));
+		// iterate over intervals
+		if (length - pos < 2 * 8 * n_intervals)
+		{
+			DBUG_PRINT(
+				"error",
+				("(length=%lu) - (pos=%lu) < 2 * 8 * (n_intervals=%" PRIu64 ")",
+				(ulong)length, (ulong)pos, n_intervals));
+			goto report_error;
+		}
+		Interval_iterator ivit(this, sidno);
+		rpl_gno last = 0;
+		for (uint i = 0; i < n_intervals; i++)
+		{
+			// read one interval
+			rpl_gno start = sint8korr(encoded + pos);
+			pos += 8;
+			rpl_gno end = sint8korr(encoded + pos);
+			pos += 8;
+			if (start <= last || end <= start)
+			{
+				DBUG_PRINT("error",
+						("last=%lld start=%lld end=%lld", last, start, end));
+				goto report_error;
+			}
+			last = end;
+			// Add interval.  Use the existing iterator position if the
+			// current interval does not begin before it.  Otherwise iterate
+			// from the beginning.
+			Interval *current = ivit.get();
+			if (current == nullptr || start < current->start) ivit.init(this, sidno);
+			DBUG_PRINT("info", ("adding %d:%lld-%lld", sidno, start, end - 1));
+			add_gno_interval(&ivit, start, end, &lock);
+		}
+	}
+	assert(pos <= length);
+	if (actual_length == nullptr)
+	{
+		if (pos != length)
+		{
+			DBUG_PRINT("error",
+						("(pos=%lu) != (length=%lu)", (ulong)pos, (ulong)length));
+			goto report_error;
+		}
+	}
+	else
+		*actual_length = pos;
 
-  RETURN_OK;
+  	RETURN_OK;
 
 report_error:
-  BINLOG_ERROR(("Malformed GTID_set encoding."),
-               (ER_MALFORMED_GTID_SET_ENCODING, MYF(0)));
-  RETURN_REPORTED_ERROR;
+	BINLOG_ERROR(("Malformed GTID_set encoding."),
+				(ER_MALFORMED_GTID_SET_ENCODING, MYF(0)));
+	RETURN_REPORTED_ERROR;
 }
 
 size_t Gtid_set::get_encoded_length() const {

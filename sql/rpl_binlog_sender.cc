@@ -253,105 +253,109 @@ Binlog_sender::Binlog_sender(THD *thd, const char *start_file,
       m_prev_event_type(binary_log::UNKNOWN_EVENT) {}
 
 void Binlog_sender::init() {
-  DBUG_TRACE;
-  THD *thd = m_thd;
+	DBUG_TRACE;
+	THD *thd = m_thd;
 
-  thd->push_diagnostics_area(&m_diag_area);
-  init_heartbeat_period();
-  m_last_event_sent_ts = now_in_nanosecs();
+	thd->push_diagnostics_area(&m_diag_area);
+	init_heartbeat_period();
+	m_last_event_sent_ts = now_in_nanosecs();
 
-  mysql_mutex_lock(&thd->LOCK_thd_data);
-  thd->current_linfo = &m_linfo;
-  mysql_mutex_unlock(&thd->LOCK_thd_data);
+	mysql_mutex_lock(&thd->LOCK_thd_data);
+	thd->current_linfo = &m_linfo;
+	mysql_mutex_unlock(&thd->LOCK_thd_data);
 
-  /* Initialize the buffer only once. */
-  m_packet.mem_realloc(PACKET_MIN_SIZE);  // size of the buffer
-  m_new_shrink_size = PACKET_MIN_SIZE;
-  DBUG_PRINT("info", ("Initial packet->alloced_length: %zu",
-                      m_packet.alloced_length()));
+	/* Initialize the buffer only once. */
+	m_packet.mem_realloc(PACKET_MIN_SIZE);  // size of the buffer
+	m_new_shrink_size = PACKET_MIN_SIZE;
+	DBUG_PRINT("info", ("Initial packet->alloced_length: %zu",
+						m_packet.alloced_length()));
 
-  if (!mysql_bin_log.is_open()) {
-    set_fatal_error("Binary log is not open");
-    return;
-  }
+	if (!mysql_bin_log.is_open())
+	{
+		set_fatal_error("Binary log is not open");
+		return;
+	}
 
-  if (DBUG_EVALUATE_IF("simulate_no_server_id", true, server_id == 0)) {
-    set_fatal_error("Misconfigured master - master server_id is 0");
-    return;
-  }
+	if (DBUG_EVALUATE_IF("simulate_no_server_id", true, server_id == 0))
+	{
+		set_fatal_error("Misconfigured master - master server_id is 0");
+		return;
+	}
 
-  if (m_using_gtid_protocol) {
-    auto gtid_mode = global_gtid_mode.get();
-    if (gtid_mode != Gtid_mode::ON) {
-      char buf[MYSQL_ERRMSG_SIZE];
-      sprintf(buf,
-              "The replication sender thread cannot start in "
-              "AUTO_POSITION mode: this server has GTID_MODE = %.192s "
-              "instead of ON.",
-              Gtid_mode::to_string(gtid_mode));
-      set_fatal_error(buf);
-      return;
-    }
-  }
+	if (m_using_gtid_protocol)
+	{
+		auto gtid_mode = global_gtid_mode.get();
+		if (gtid_mode != Gtid_mode::ON) {
+			char buf[MYSQL_ERRMSG_SIZE];
+			sprintf(buf,
+					"The replication sender thread cannot start in "
+					"AUTO_POSITION mode: this server has GTID_MODE = %.192s "
+					"instead of ON.",
+					Gtid_mode::to_string(gtid_mode));
+			set_fatal_error(buf);
+			return;
+		}
+	}
 
-  if (check_start_file()) return;
+	if (check_start_file()) return;
 
-  LogErr(INFORMATION_LEVEL, ER_RPL_BINLOG_STARTING_DUMP, thd->thread_id(),
-         thd->server_id, m_start_file, m_start_pos);
+	LogErr(INFORMATION_LEVEL, ER_RPL_BINLOG_STARTING_DUMP, thd->thread_id(),
+			thd->server_id, m_start_file, m_start_pos);
 
-  if (RUN_HOOK(
-          binlog_transmit, transmit_start,
-          (thd, m_flag, m_start_file, m_start_pos, &m_observe_transmission))) {
-    set_unknown_error("Failed to run hook 'transmit_start'");
-    return;
-  }
-  m_transmit_started = true;
+	if (RUN_HOOK(
+			binlog_transmit, transmit_start,
+			(thd, m_flag, m_start_file, m_start_pos, &m_observe_transmission)))
+	{
+		set_unknown_error("Failed to run hook 'transmit_start'");
+		return;
+	}
+	m_transmit_started = true;
 
-  init_checksum_alg();
-  /*
-    There are two ways to tell the server to not block:
+	init_checksum_alg();
+	/*
+		There are two ways to tell the server to not block:
 
-    - Set the BINLOG_DUMP_NON_BLOCK flag.
-      This is official, documented, not used by any mysql
-      client, but used by some external users.
+		- Set the BINLOG_DUMP_NON_BLOCK flag.
+		This is official, documented, not used by any mysql
+		client, but used by some external users.
 
-    - Set server_id=0.
-      This is unofficial, undocumented, and used by
-      mysqlbinlog -R since the beginning of time.
+		- Set server_id=0.
+		This is unofficial, undocumented, and used by
+		mysqlbinlog -R since the beginning of time.
 
-    When mysqlbinlog --stop-never is used, it sets a 'fake'
-    server_id that defaults to 1 but can be set to anything
-    else using stop-never-slave-server-id. This has the
-    drawback that if the server_id conflicts with any other
-    running slave, or with any other instance of mysqlbinlog
-    --stop-never, then that other instance will be killed.  It
-    is also an unnecessary burden on the user to have to
-    specify a server_id different from all other server_ids
-    just to avoid conflicts.
+		When mysqlbinlog --stop-never is used, it sets a 'fake'
+		server_id that defaults to 1 but can be set to anything
+		else using stop-never-slave-server-id. This has the
+		drawback that if the server_id conflicts with any other
+		running slave, or with any other instance of mysqlbinlog
+		--stop-never, then that other instance will be killed.  It
+		is also an unnecessary burden on the user to have to
+		specify a server_id different from all other server_ids
+		just to avoid conflicts.
 
-    As of MySQL 5.6.20 and 5.7.5, mysqlbinlog redundantly sets
-    the BINLOG_DUMP_NONBLOCK flag when one or both of the
-    following holds:
-    - the --stop-never option is *not* specified
+		As of MySQL 5.6.20 and 5.7.5, mysqlbinlog redundantly sets
+		the BINLOG_DUMP_NONBLOCK flag when one or both of the
+		following holds:
+		- the --stop-never option is *not* specified
 
-    In a far future, this means we can remove the unofficial
-    functionality that server_id=0 implies nonblocking
-    behavior. That will allow mysqlbinlog to use server_id=0
-    always. That has the advantage that mysqlbinlog
-    --stop-never cannot cause any running dump threads to be
-    killed.
-  */
-  m_wait_new_events =
-      !((thd->server_id == 0) || ((m_flag & BINLOG_DUMP_NON_BLOCK) != 0));
-  /* Binary event can be vary large. So set it to max allowed packet. */
-  thd->variables.max_allowed_packet = MAX_MAX_ALLOWED_PACKET;
+		In a far future, this means we can remove the unofficial
+		functionality that server_id=0 implies nonblocking
+		behavior. That will allow mysqlbinlog to use server_id=0
+		always. That has the advantage that mysqlbinlog
+		--stop-never cannot cause any running dump threads to be
+		killed.
+	*/
+	m_wait_new_events =
+		!((thd->server_id == 0) || ((m_flag & BINLOG_DUMP_NON_BLOCK) != 0));
+	/* Binary event can be vary large. So set it to max allowed packet. */
+	thd->variables.max_allowed_packet = MAX_MAX_ALLOWED_PACKET;
 
 #ifndef NDEBUG
-  if (opt_sporadic_binlog_dump_fail && (binlog_dump_count++ % 2))
-    set_unknown_error(
-        "Master fails in COM_BINLOG_DUMP because of "
-        "--sporadic-binlog-dump-fail");
-  m_event_count = 0;
+	if (opt_sporadic_binlog_dump_fail && (binlog_dump_count++ % 2))
+		set_unknown_error(
+			"Master fails in COM_BINLOG_DUMP because of "
+			"--sporadic-binlog-dump-fail");
+	m_event_count = 0;
 #endif
 }
 
@@ -377,154 +381,166 @@ void Binlog_sender::cleanup() {
     my_eof(thd);
 }
 
-void Binlog_sender::run() {
-  DBUG_TRACE;
-  init();
+void Binlog_sender::run()
+{
+	DBUG_TRACE;
+	init();
 
-  unsigned int max_event_size =
-      std::max(m_thd->variables.max_allowed_packet,
-               binlog_row_event_max_size + MAX_LOG_EVENT_HEADER);
-  File_reader reader(opt_source_verify_checksum, max_event_size);
-  my_off_t start_pos = m_start_pos;
-  const char *log_file = m_linfo.log_file_name;
-  bool is_index_file_reopened_on_binlog_disable = false;
+	unsigned int max_event_size =
+		std::max(m_thd->variables.max_allowed_packet,
+				binlog_row_event_max_size + MAX_LOG_EVENT_HEADER);
+	File_reader reader(opt_master_verify_checksum, max_event_size);
+	my_off_t start_pos = m_start_pos;
+	const char *log_file = m_linfo.log_file_name;
+	bool is_index_file_reopened_on_binlog_disable = false;
 
-  reader.allocator()->set_sender(this);
-  while (!has_error() && !m_thd->killed) {
-    /*
-      Faked rotate event is only required in a few cases(see comment of the
-      function). But even so, a faked rotate event is always sent before sending
-      event log file, even if a rotate log event exists in last binlog and
-      was already sent. The slave then gets an extra rotation and records
-      two Rotate_log_events.
+	reader.allocator()->set_sender(this);
+	while (!has_error() && !m_thd->killed)
+	{
+		/*
+		Faked rotate event is only required in a few cases(see comment of the
+		function). But even so, a faked rotate event is always sent before sending
+		event log file, even if a rotate log event exists in last binlog and
+		was already sent. The slave then gets an extra rotation and records
+		two Rotate_log_events.
 
-      The main issue here are some dependencies on mysqlbinlog, that should be
-      solved in the future.
-    */
-    if (unlikely(fake_rotate_event(log_file, start_pos))) break;
+		The main issue here are some dependencies on mysqlbinlog, that should be
+		solved in the future.
+		*/
+		if (unlikely(fake_rotate_event(log_file, start_pos))) break;
 
-    if (reader.open(log_file)) {
-      set_fatal_error(log_read_error_msg(reader.get_error_type()));
-      break;
-    }
+		if (reader.open(log_file))
+		{
+			set_fatal_error(log_read_error_msg(reader.get_error_type()));
+			break;
+		}
 
-    THD_STAGE_INFO(m_thd, stage_sending_binlog_event_to_replica);
-    if (send_binlog(&reader, start_pos)) break;
+		THD_STAGE_INFO(m_thd, stage_sending_binlog_event_to_slave);
+		if (send_binlog(&reader, start_pos)) break;
 
-    /* Will go to next file, need to copy log file name */
-    set_last_file(log_file);
+		/* Will go to next file, need to copy log file name */
+		set_last_file(log_file);
 
-    THD_STAGE_INFO(m_thd,
-                   stage_finished_reading_one_binlog_switching_to_next_binlog);
-    DBUG_EXECUTE_IF("waiting_for_disable_binlog", {
-      const char act[] =
-          "now "
-          "signal dump_thread_reached_wait_point "
-          "wait_for continue_dump_thread no_clear_event";
-      assert(!debug_sync_set_action(m_thd, STRING_WITH_LEN(act)));
-    };);
-    mysql_bin_log.lock_index();
-    if (!mysql_bin_log.is_open()) {
-      if (mysql_bin_log.open_index_file(mysql_bin_log.get_index_fname(),
-                                        log_file, false)) {
-        set_fatal_error(
-            "Binary log is not open and failed to open index file "
-            "to retrieve next file.");
-        mysql_bin_log.unlock_index();
-        break;
-      }
-      is_index_file_reopened_on_binlog_disable = true;
-    }
-    int error = mysql_bin_log.find_next_log(&m_linfo, false);
-    mysql_bin_log.unlock_index();
-    if (unlikely(error)) {
-      DBUG_EXECUTE_IF("waiting_for_disable_binlog", {
-        const char act[] = "now signal consumed_binlog";
-        assert(!debug_sync_set_action(m_thd, STRING_WITH_LEN(act)));
-      };);
-      if (is_index_file_reopened_on_binlog_disable)
-        mysql_bin_log.close(LOG_CLOSE_INDEX, true /*need_lock_log=true*/,
-                            true /*need_lock_index=true*/);
-      set_fatal_error("could not find next log");
-      break;
-    }
+		THD_STAGE_INFO(m_thd,
+					stage_finished_reading_one_binlog_switching_to_next_binlog);
+		DBUG_EXECUTE_IF("waiting_for_disable_binlog", {
+		const char act[] =
+			"now "
+			"signal dump_thread_reached_wait_point "
+			"wait_for continue_dump_thread no_clear_event";
+		assert(!debug_sync_set_action(m_thd, STRING_WITH_LEN(act)));
+		};);
+		mysql_bin_log.lock_index();
+		if (!mysql_bin_log.is_open())
+		{
+			if (mysql_bin_log.open_index_file(mysql_bin_log.get_index_fname(),
+												log_file, false))
+			{
+				set_fatal_error(
+					"Binary log is not open and failed to open index file "
+					"to retrieve next file.");
+				mysql_bin_log.unlock_index();
+				break;
+			}
+			is_index_file_reopened_on_binlog_disable = true;
+		}
 
-    start_pos = BIN_LOG_HEADER_SIZE;
-    reader.close();
-  }
+		int error = mysql_bin_log.find_next_log(&m_linfo, false);
+		mysql_bin_log.unlock_index();
+		if (unlikely(error))
+		{
+			DBUG_EXECUTE_IF("waiting_for_disable_binlog", {
+				const char act[] = "now signal consumed_binlog";
+				assert(!debug_sync_set_action(m_thd, STRING_WITH_LEN(act)));
+			};);
+			if (is_index_file_reopened_on_binlog_disable)
+				mysql_bin_log.close(LOG_CLOSE_INDEX, true /*need_lock_log=true*/,
+									true /*need_lock_index=true*/);
+			set_fatal_error("could not find next log");
+			break;
+		}
 
-  THD_STAGE_INFO(m_thd, stage_waiting_to_finalize_termination);
-  char error_text[MAX_SLAVE_ERRMSG + 100];
+		start_pos = BIN_LOG_HEADER_SIZE;
+		reader.close();
+	}
 
-  /*
-    If the dump thread was killed because of a duplicate slave UUID we
-    will fail throwing an error to the slave so it will not try to
-    reconnect anymore.
-  */
-  mysql_mutex_lock(&m_thd->LOCK_thd_data);
-  bool was_killed_by_duplicate_slave_id = m_thd->duplicate_slave_id;
-  mysql_mutex_unlock(&m_thd->LOCK_thd_data);
-  if (was_killed_by_duplicate_slave_id)
-    set_fatal_error(
-        "A slave with the same server_uuid/server_id as this slave "
-        "has connected to the master");
+	THD_STAGE_INFO(m_thd, stage_waiting_to_finalize_termination);
+	char error_text[MAX_SLAVE_ERRMSG + 100];
 
-  if (reader.is_open()) {
-    if (is_fatal_error()) {
-      /* output events range to error message */
-      snprintf(error_text, sizeof(error_text),
-               "%s; the first event '%s' at %lld, "
-               "the last event read from '%s' at %lld, "
-               "the last byte read from '%s' at %lld.",
-               m_errmsg, m_start_file, m_start_pos, m_last_file, m_last_pos,
-               log_file, reader.position());
-      set_fatal_error(error_text);
-    }
+	/*
+		If the dump thread was killed because of a duplicate slave UUID we
+		will fail throwing an error to the slave so it will not try to
+		reconnect anymore.
+	*/
+	mysql_mutex_lock(&m_thd->LOCK_thd_data);
+	bool was_killed_by_duplicate_slave_id = m_thd->duplicate_slave_id;
+	mysql_mutex_unlock(&m_thd->LOCK_thd_data);
+	if (was_killed_by_duplicate_slave_id)
+		set_fatal_error(
+			"A slave with the same server_uuid/server_id as this slave "
+			"has connected to the master");
 
-    reader.close();
-  }
+	if (reader.is_open())
+	{
+		if (is_fatal_error())
+		{
+			/* output events range to error message */
+			snprintf(error_text, sizeof(error_text),
+					"%s; the first event '%s' at %lld, "
+					"the last event read from '%s' at %lld, "
+					"the last byte read from '%s' at %lld.",
+					m_errmsg, m_start_file, m_start_pos, m_last_file, m_last_pos,
+					log_file, reader.position());
+			set_fatal_error(error_text);
+		}
 
-  cleanup();
+		reader.close();
+	}
+
+	cleanup();
 }
 
-int Binlog_sender::send_binlog(File_reader *reader, my_off_t start_pos) {
-  if (unlikely(send_format_description_event(reader, start_pos))) return 1;
+int Binlog_sender::send_binlog(File_reader *reader, my_off_t start_pos)
+{
+	if (unlikely(send_format_description_event(reader, start_pos))) return 1;
 
-  if (start_pos == BIN_LOG_HEADER_SIZE) start_pos = reader->position();
+	if (start_pos == BIN_LOG_HEADER_SIZE) start_pos = reader->position();
 
-  if (m_check_previous_gtid_event) {
-    bool has_prev_gtid_ev;
-    if (has_previous_gtid_log_event(reader, &has_prev_gtid_ev)) return 1;
+	if (m_check_previous_gtid_event)
+	{
+		bool has_prev_gtid_ev;
+		if (has_previous_gtid_log_event(reader, &has_prev_gtid_ev)) return 1;
 
-    if (!has_prev_gtid_ev) return 0;
-  }
+		if (!has_prev_gtid_ev) return 0;
+	}
 
-  /*
-    Slave is requesting a position which is in the middle of a file,
-    so seek to the correct position.
-  */
-  if (reader->position() != start_pos && reader->seek(start_pos)) return 1;
+	/*
+		Slave is requesting a position which is in the middle of a file,
+		so seek to the correct position.
+	*/
+	if (reader->position() != start_pos && reader->seek(start_pos)) return 1;
 
-  while (!m_thd->killed) {
-    my_off_t end_pos = 0;
+	while (!m_thd->killed)
+	{
+		my_off_t end_pos = 0;
 
-    if (get_binlog_end_pos(reader, &end_pos)) return 1;
-    if (send_events(reader, end_pos)) return 1;
-    /*
-      It is not active binlog, send_events should not return unless
-      it reads all events.
-    */
-    if (end_pos == 0) return 0;
+		if (get_binlog_end_pos(reader, &end_pos)) return 1;
+		if (send_events(reader, end_pos)) return 1;
+		/*
+		It is not active binlog, send_events should not return unless
+		it reads all events.
+		*/
+		if (end_pos == 0) return 0;
 
-    m_thd->killed.store(DBUG_EVALUATE_IF(
-        "simulate_kill_dump", THD::KILL_CONNECTION, m_thd->killed.load()));
+		m_thd->killed.store(DBUG_EVALUATE_IF(
+			"simulate_kill_dump", THD::KILL_CONNECTION, m_thd->killed.load()));
 
-    DBUG_EXECUTE_IF("wait_after_binlog_EOF", {
-      const char act[] = "now wait_for signal.rotate_finished no_clear_event";
-      assert(!debug_sync_set_action(m_thd, STRING_WITH_LEN(act)));
-    };);
-  }
-  return 1;
+		DBUG_EXECUTE_IF("wait_after_binlog_EOF", {
+		const char act[] = "now wait_for signal.rotate_finished no_clear_event";
+		assert(!debug_sync_set_action(m_thd, STRING_WITH_LEN(act)));
+		};);
+	}
+	return 1;
 }
 
 int Binlog_sender::get_binlog_end_pos(File_reader *reader, my_off_t *end_pos) {
@@ -830,142 +846,177 @@ void Binlog_sender::init_heartbeat_period() {
   mysql_mutex_unlock(&m_thd->LOCK_thd_data);
 }
 
-int Binlog_sender::check_start_file() {
-  char index_entry_name[FN_REFLEN];
-  char *name_ptr = nullptr;
-  const char *errmsg;
+int Binlog_sender::check_start_file()
+{
+	char index_entry_name[FN_REFLEN];
+	char *name_ptr = nullptr;
+	const char *errmsg;
 
-  if (m_start_file[0] != '\0') {
-    mysql_bin_log.make_log_name(index_entry_name, m_start_file);
-    name_ptr = index_entry_name;
-  } else if (m_using_gtid_protocol) {
-    /*
-      In normal scenarios, it is not possible that Slave will
-      contain more gtids than Master with resepctive to Master's
-      UUID. But it could be possible case if Master's binary log
-      is truncated(due to raid failure) or Master's binary log is
-      deleted but GTID_PURGED was not set properly. That scenario
-      needs to be validated, i.e., it should *always* be the case that
-      Slave's gtid executed set (+retrieved set) is a subset of
-      Master's gtid executed set with respective to Master's UUID.
-      If it happens, dump thread will be stopped during the handshake
-      with Slave (thus the Slave's I/O thread will be stopped with the
-      error. Otherwise, it can lead to data inconsistency between Master
-      and Slave.
-    */
-    Sid_map *slave_sid_map = m_exclude_gtid->get_sid_map();
-    assert(slave_sid_map);
-    global_sid_lock->wrlock();
-    const rpl_sid &server_sid = gtid_state->get_server_sid();
-    rpl_sidno subset_sidno = slave_sid_map->sid_to_sidno(server_sid);
-    Gtid_set gtid_executed_and_owned(
-        gtid_state->get_executed_gtids()->get_sid_map());
+	if (m_start_file[0] != '\0')
+	{
+		mysql_bin_log.make_log_name(index_entry_name, m_start_file);
+		name_ptr = index_entry_name;
+	}
+	// 使用 executed_gtid_set 的方式
+	else if (m_using_gtid_protocol)
+	{
+		/*
+		在正常情况下，Slave 不可能比 Master 包含更多的 gtids 并分别对应 Master 的 UUID。
+		但是，如果 Master 的二进制日志被截断（由于 raid 失败）
+		或 Master 的二进制日志被删除但 GTID_PURGED 设置不正确，则可能出现这种情况。
+		该场景需要被验证，即：
+			Slave 的 gtid executed set（+retrieevd set）应该总是 Master gtid executed set 的子集，
+			且与主的 UUID 相对应。
+			如果发生这种情况，dump thread 将在与 Slave 握手的过程中将停止
+			（因此 Slave 的 I/O 线程将因错误而停止。否则会导致 Master 和 Slave 之间的数据不一致。）
+		*/
 
-    // gtids = executed_gtids & owned_gtids
-    if (gtid_executed_and_owned.add_gtid_set(
-            gtid_state->get_executed_gtids()) != RETURN_STATUS_OK) {
-      assert(0);
-    }
-    gtid_state->get_owned_gtids()->get_gtids(gtid_executed_and_owned);
+		// MySQL 启动时，会把 auto.cnf 中 server-uuid 字符串转换成字节数组存放在 rpl_sid 中，删除该文件时会重新生成
+		// rpl_sidno 为一个从 1 开始累加的整数值，每重新生成一次 UUID 就会累加一次
+		// 每个 Gtid_set 中都包含一个 Sid_map，这个 Sid_map 是全局的
+		// 它保存着 rpl_sid(128bit) => rpl_sidno(32 bit) 的对应关系
+		// Sid_map 保存着哈希查找方式，rpl_sid（UUID）为key，rpl_sidno（整数）为 value
+		// sid 即 UUID，必须保证主从唯一，但 sidno 不一定。所以对比GTID的时候，需要转换
+		// 这里 m_exclude_gtid 来自 slave_gtid_executed，此处为获取其 Sid_map，即从库的 sidno 与 sid 对应关系
+		Sid_map *slave_sid_map = m_exclude_gtid->get_sid_map();
+		assert(slave_sid_map);
+		// 获取当前主库的 sid（server UUID）
+		global_sid_lock->wrlock();
+		const rpl_sid &server_sid = gtid_state->get_server_sid();
+		// 把主库的 sid 转换为 sidno 进行判断
+		// 若 sid 在 slave 的 sid_map 中返回 sidno, 否则返回 0
+		rpl_sidno subset_sidno = slave_sid_map->sid_to_sidno(server_sid);
+		// 得到主库的 executed gtid set 对应的 sid map
+		Gtid_set gtid_executed_and_owned(
+			gtid_state->get_executed_gtids()->get_sid_map());
 
-    if (!m_exclude_gtid->is_subset_for_sid(&gtid_executed_and_owned,
-                                           gtid_state->get_server_sidno(),
-                                           subset_sidno)) {
-      errmsg = ER_THD(m_thd, ER_SLAVE_HAS_MORE_GTIDS_THAN_MASTER);
-      global_sid_lock->unlock();
-      set_fatal_error(errmsg);
-      return 1;
-    }
-    /*
-      Setting GTID_PURGED (when GTID_EXECUTED set is empty i.e., when
-      previous_gtids are also empty) will make binlog rotate. That
-      leaves first binary log with empty previous_gtids and second
-      binary log's previous_gtids with the value of gtid_purged.
-      In find_first_log_not_in_gtid_set() while we search for a binary
-      log whose previous_gtid_set is subset of slave_gtid_executed,
-      in this particular case, server will always find the first binary
-      log with empty previous_gtids which is subset of any given
-      slave_gtid_executed. Thus Master thinks that it found the first
-      binary log which is actually not correct and unable to catch
-      this error situation. Hence adding below extra if condition
-      to check the situation. Slave should know about Master's purged GTIDs.
-      If Slave's GTID executed + retrieved set does not contain Master's
-      complete purged GTID list, that means Slave is requesting(expecting)
-      GTIDs which were purged by Master. We should let Slave know about the
-      situation. i.e., throw error if slave's GTID executed set is not
-      a superset of Master's purged GTID set.
-      The other case, where user deleted binary logs manually
-      (without using 'PURGE BINARY LOGS' command) but gtid_purged
-      is not set by the user, the following if condition cannot catch it.
-      But that is not a problem because in find_first_log_not_in_gtid_set()
-      while checking for subset previous_gtids binary log, the logic
-      will not find one and an error ER_MASTER_HAS_PURGED_REQUIRED_GTIDS
-      is thrown from there.
-    */
-    if (!gtid_state->get_lost_gtids()->is_subset(m_exclude_gtid)) {
-      mysql_bin_log.report_missing_purged_gtids(m_exclude_gtid, &errmsg);
-      global_sid_lock->unlock();
-      set_fatal_error(errmsg);
-      return 1;
-    }
-    global_sid_lock->unlock();
-    Gtid first_gtid = {0, 0};
-    if (mysql_bin_log.find_first_log_not_in_gtid_set(
-            index_entry_name, m_exclude_gtid, &first_gtid, &errmsg)) {
-      set_fatal_error(errmsg);
-      return 1;
-    }
-    name_ptr = index_entry_name;
-    /*
-      find_first_log_not_in_gtid_set() guarantees the file it found has
-      Previous_gtids_log_event as all following binlogs. So the variable is
-      set to false which tells not to check the event again when starting to
-      dump binglogs.
-    */
-    m_check_previous_gtid_event = false;
-    /*
-      If we are skipping at least the first transaction of the binlog,
-      we must clear the "created" field of the FD event (set it to 0)
-      to avoid cleaning up temp tables on slave.
-    */
-    m_gtid_clear_fd_created_flag =
-        (first_gtid.sidno >= 1 && first_gtid.gno >= 1 &&
-         m_exclude_gtid->contains_gtid(first_gtid));
-  }
+		// gtid_executed_and_owned 加入 gtid_executed 表中保存的 GTID 集合
+		// gtids = executed_gtids & owned_gtids
+		if (gtid_executed_and_owned.add_gtid_set(
+				gtid_state->get_executed_gtids()) != RETURN_STATUS_OK)
+		{
+			assert(0);
+		}
+		// gtid_executed_and_owned 加入已经申请但仍在处理中的 GTID set: gtid_owned
+		gtid_state->get_owned_gtids()->get_gtids(gtid_executed_and_owned);
 
-  /*
-    Index entry name is saved into m_linfo. If name_ptr is NULL,
-    then starts from the first file in index file.
-  */
+		// 如果 subset_sidno 为 0，即在 slave executed_gtid_set 中找不到主库 UUID 对应的记录，返回 True
+		// 否则分别根据主库和从库各自的 rpl_sidno 从各自的 Gtid_set 中找到对应的元素迭代:
+		// 依次遍历从库中每个元素，然后与主库中的元素比较。
+		// - 如果从库元素的起始值大于主库元素的结束值，则查找主库的下一个元素
+		// - 如果从库元素的起始值小于主库元素的起始值，或者从库元素的结束值大于主库元素的结束值，返回 False
+		// 
+		// 综上，保证 slave_gtid_executed 中关于主库 UUID 的 GTID_set 
+		// 是主库 gtid_executed_and_owned的 子集，如果不是，则报错退出
+		if (!m_exclude_gtid->is_subset_for_sid(&gtid_executed_and_owned,
+											   gtid_state->get_server_sidno(), // Return the server's SID's SIDNO
+											   subset_sidno))
+		{
+			errmsg = ER_THD(m_thd, ER_SLAVE_HAS_MORE_GTIDS_THAN_MASTER);
+			global_sid_lock->unlock();
+			set_fatal_error(errmsg);
+			return 1;
+		}
+		// 设置GTID_PURGED（当GTID_EXECUTED集为空时，即当previous_gtids也为空时）会使binlog旋转。这使得第一个二进制日志的previous_gtids为空，第二个二进制日志的previous_gtids为gtid_purged的值。在find_first_log_not_in_gtid_set()中，虽然我们搜索一个二进制日志，其previous_gtid_set是slave_gtid_executed的子集，在这种特殊情况下，服务器总是会找到第一个二进制日志，其previous_gtids为空，是任何特定slave_gtid_executed的子集。因此，Master认为它找到了第一个二进制日志，这实际上是不正确的，无法抓住这种错误情况。因此，添加以下额外的if条件来检查这种情况。Slave应该知道Master的被清除的GTIDs。如果Slave的GTID执行+检索集不包含Master的完整的被清除的GTID列表，这意味着Slave正在请求(期望)被Master清除的GTIDs。我们应该让Slave知道这种情况，也就是说，如果Slave的GTID执行集不是Master的被清除的GTID集的超集，就抛出错误。另一种情况是，用户手动删除了二进制日志（没有使用'PURGE BINARY LOGS'命令），但用户没有设置gtid_purged，下面的if条件不能捕捉它。但这不是一个问题，因为在find_first_log_not_in_gtid_set()中，当检查子集previous_gtids二进制日志时，逻辑不会找到一个，并且从那里抛出一个错误ER_MASTER_HAS_PURGED_REQUIRED_GTIDS。
+		/*
+		Setting GTID_PURGED (when GTID_EXECUTED set is empty i.e., when
+		previous_gtids are also empty) will make binlog rotate. That
+		leaves first binary log with empty previous_gtids and second
+		binary log's previous_gtids with the value of gtid_purged.
+		In find_first_log_not_in_gtid_set() while we search for a binary
+		log whose previous_gtid_set is subset of slave_gtid_executed,
+		in this particular case, server will always find the first binary
+		log with empty previous_gtids which is subset of any given
+		slave_gtid_executed. Thus Master thinks that it found the first
+		binary log which is actually not correct and unable to catch
+		this error situation. Hence adding below extra if condition
+		to check the situation. Slave should know about Master's purged GTIDs.
+		If Slave's GTID executed + retrieved set does not contain Master's
+		complete purged GTID list, that means Slave is requesting(expecting)
+		GTIDs which were purged by Master. We should let Slave know about the
+		situation. i.e., throw error if slave's GTID executed set is not
+		a superset of Master's purged GTID set.
+		The other case, where user deleted binary logs manually
+		(without using 'PURGE BINARY LOGS' command) but gtid_purged
+		is not set by the user, the following if condition cannot catch it.
+		But that is not a problem because in find_first_log_not_in_gtid_set()
+		while checking for subset previous_gtids binary log, the logic
+		will not find one and an error ER_MASTER_HAS_PURGED_REQUIRED_GTIDS
+		is thrown from there.
+		*/
+		if (!gtid_state->get_lost_gtids()->is_subset(m_exclude_gtid))
+		{
+			mysql_bin_log.report_missing_purged_gtids(m_exclude_gtid, &errmsg);
+			global_sid_lock->unlock();
+			set_fatal_error(errmsg);
+			return 1;
+		}
+		global_sid_lock->unlock();
 
-  if (mysql_bin_log.find_log_pos(&m_linfo, name_ptr, true)) {
-    set_fatal_error(
-        "Could not find first log file name in binary log "
-        "index file");
-    return 1;
-  }
 
-  if (m_start_pos < BIN_LOG_HEADER_SIZE) {
-    set_fatal_error(
-        "Client requested master to start replication "
-        "from position < 4");
-    return 1;
-  }
+		Gtid first_gtid = {0, 0};
+		// 这时候 mysql_bin_log 是啥？？？（理论上是传进来的，但 from gtid 也要带 binlog filename？
+		if (mysql_bin_log.find_first_log_not_in_gtid_set(
+				index_entry_name, m_exclude_gtid, &first_gtid, &errmsg))
+		{
+			set_fatal_error(errmsg);
+			return 1;
+		}
+		name_ptr = index_entry_name;
+		/*
+		find_first_log_not_in_gtid_set() guarantees the file it found has
+		Previous_gtids_log_event as all following binlogs. So the variable is
+		set to false which tells not to check the event again when starting to
+		dump binglogs.
+		*/
+		m_check_previous_gtid_event = false;
+		/*
+		If we are skipping at least the first transaction of the binlog,
+		we must clear the "created" field of the FD event (set it to 0)
+		to avoid cleaning up temp tables on slave.
+		*/
+		m_gtid_clear_fd_created_flag =
+			(first_gtid.sidno >= 1 && first_gtid.gno >= 1 &&
+			m_exclude_gtid->contains_gtid(first_gtid));
+	}
 
-  Binlog_read_error binlog_read_error;
-  Binlog_ifile binlog_ifile(&binlog_read_error);
-  if (binlog_ifile.open(m_linfo.log_file_name)) {
-    set_fatal_error(binlog_read_error.get_str());
-    return 1;
-  }
+	/*
+		Index entry name is saved into m_linfo. If name_ptr is NULL,
+		then starts from the first file in index file.
+	*/
 
-  if (m_start_pos > binlog_ifile.length()) {
-    set_fatal_error(
-        "Client requested master to start replication from "
-        "position > file size");
-    return 1;
-  }
-  return 0;
+	if (mysql_bin_log.find_log_pos(&m_linfo, name_ptr, true))
+	{
+		set_fatal_error(
+			"Could not find first log file name in binary log "
+			"index file");
+		return 1;
+	}
+
+	if (m_start_pos < BIN_LOG_HEADER_SIZE)
+	{
+		set_fatal_error(
+			"Client requested master to start replication "
+			"from position < 4");
+		return 1;
+	}
+
+	Binlog_read_error binlog_read_error;
+	Binlog_ifile binlog_ifile(&binlog_read_error);
+	if (binlog_ifile.open(m_linfo.log_file_name))
+	{
+		set_fatal_error(binlog_read_error.get_str());
+		return 1;
+	}
+
+	if (m_start_pos > binlog_ifile.length())
+	{
+		set_fatal_error(
+			"Client requested master to start replication from "
+			"position > file size");
+		return 1;
+	}
+	return 0;
 }
 
 extern TYPELIB binlog_checksum_typelib;

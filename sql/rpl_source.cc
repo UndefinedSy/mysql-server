@@ -979,11 +979,18 @@ error_malformed_packet:
   return true;
 }
 
+/**
+ * 
+ * @param log_ident, binlog-filename
+ * @param pos, binlog-pos
+ * @param slave_gtid_executed
+ * 
+ */
 void mysql_binlog_send(THD *thd, char *log_ident, my_off_t pos,
                        Gtid_set *slave_gtid_executed, uint32 flags) {
-  Binlog_sender sender(thd, log_ident, pos, slave_gtid_executed, flags);
+    Binlog_sender sender(thd, log_ident, pos, slave_gtid_executed, flags);
 
-  sender.run();
+    sender.run();
 }
 
 const user_var_entry *get_user_var_from_alternatives(const THD *thd,

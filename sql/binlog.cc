@@ -5311,94 +5311,95 @@ static int compare_log_name(const char *log_1, const char *log_2) {
 }
 
 /**
-  Find the position in the log-index-file for the given log name.
+ * 查找对于传入的 log_name 对应的 log-index-file 的位置
+ * @param[out] linfo 找到的 log file name 以及索引文件中下一个 log file name 的 offset
+ * @param log_name 需要在索引文件中查找的文件名
+ * 				   设置为 NULL 时则会读取第一个 entry
+ * @param need_lock_index 如果为 false，则该函数会锁 LOCK_index；
+ * 						  如果为 true，则调用者应持有了该锁
+ * 
+ * @note 在没有 truncate 函数的系统上，文件将以一个或多个空行结束。这在读取文件时将被忽略。
+ * @retval 0				ok
+ *         LOG_INFO_EOF	    End of log-index-file found
+ *		   LOG_INFO_IO		Got IO error while reading file
+ */
+int MYSQL_BIN_LOG::find_log_pos(LOG_INFO *linfo,
+								const char *log_name,
+                                bool need_lock_index)
+{
+	int error = 0;
+	char *full_fname = linfo->log_file_name;
+	char full_log_name[FN_REFLEN], fname[FN_REFLEN];
+	DBUG_TRACE;
+	full_log_name[0] = full_fname[0] = 0;
 
-  @param[out] linfo The found log file name will be stored here, along
-  with the byte offset of the next log file name in the index file.
-  @param log_name Filename to find in the index file, or NULL if we
-  want to read the first entry.
-  @param need_lock_index If false, this function acquires LOCK_index;
-  otherwise the lock should already be held by the caller.
+	/*
+		Mutex needed because we need to make sure the file pointer does not
+		move from under our feet
+	*/
+	if (need_lock_index)
+		mysql_mutex_lock(&LOCK_index);
+	else
+		mysql_mutex_assert_owner(&LOCK_index);
 
-  @note
-    On systems without the truncate function the file will end with one or
-    more empty lines.  These will be ignored when reading the file.
+	// 检查 index_file buffer 不应为 nullptr
+	if (!my_b_inited(&index_file))
+	{
+		error = LOG_INFO_IO;
+		goto end;
+	}
 
-  @retval
-    0			ok
-  @retval
-    LOG_INFO_EOF	        End of log-index-file found
-  @retval
-    LOG_INFO_IO		Got IO error while reading file
-*/
+	// extend relative paths for log_name to be searched
+	if (log_name)
+	{
+		if (normalize_binlog_name(full_log_name, log_name, is_relay_log))
+		{
+			error = LOG_INFO_EOF;
+			goto end;
+		}
+	}
 
-int MYSQL_BIN_LOG::find_log_pos(LOG_INFO *linfo, const char *log_name,
-                                bool need_lock_index) {
-  int error = 0;
-  char *full_fname = linfo->log_file_name;
-  char full_log_name[FN_REFLEN], fname[FN_REFLEN];
-  DBUG_TRACE;
-  full_log_name[0] = full_fname[0] = 0;
+	DBUG_PRINT("enter", ("log_name: %s, full_log_name: %s",
+						log_name ? log_name : "NULL", full_log_name));
 
-  /*
-    Mutex needed because we need to make sure the file pointer does not
-    move from under our feet
-  */
-  if (need_lock_index)
-    mysql_mutex_lock(&LOCK_index);
-  else
-    mysql_mutex_assert_owner(&LOCK_index);
+	/* As the file is flushed, we can't get an error here */
+	my_b_seek(&index_file, (my_off_t)0);
 
-  if (!my_b_inited(&index_file)) {
-    error = LOG_INFO_IO;
-    goto end;
-  }
+	for (;;)
+	{
+		size_t length;
+		my_off_t offset = my_b_tell(&index_file);
 
-  // extend relative paths for log_name to be searched
-  if (log_name) {
-    if (normalize_binlog_name(full_log_name, log_name, is_relay_log)) {
-      error = LOG_INFO_EOF;
-      goto end;
-    }
-  }
+		DBUG_EXECUTE_IF("simulate_find_log_pos_error", error = LOG_INFO_EOF;
+						break;);
+		/* If we get 0 or 1 characters, this is the end of the file */
+		if ((length = my_b_gets(&index_file, fname, FN_REFLEN)) <= 1)
+		{
+			/* Did not find the given entry; Return not found or error */
+			error = !index_file.error ? LOG_INFO_EOF : LOG_INFO_IO;
+			break;
+		}
 
-  DBUG_PRINT("enter", ("log_name: %s, full_log_name: %s",
-                       log_name ? log_name : "NULL", full_log_name));
-
-  /* As the file is flushed, we can't get an error here */
-  my_b_seek(&index_file, (my_off_t)0);
-
-  for (;;) {
-    size_t length;
-    my_off_t offset = my_b_tell(&index_file);
-
-    DBUG_EXECUTE_IF("simulate_find_log_pos_error", error = LOG_INFO_EOF;
-                    break;);
-    /* If we get 0 or 1 characters, this is the end of the file */
-    if ((length = my_b_gets(&index_file, fname, FN_REFLEN)) <= 1) {
-      /* Did not find the given entry; Return not found or error */
-      error = !index_file.error ? LOG_INFO_EOF : LOG_INFO_IO;
-      break;
-    }
-
-    // extend relative paths and match against full path
-    if (normalize_binlog_name(full_fname, fname, is_relay_log)) {
-      error = LOG_INFO_EOF;
-      break;
-    }
-    // if the log entry matches, null string matching anything
-    if (!log_name || !compare_log_name(full_fname, full_log_name)) {
-      DBUG_PRINT("info", ("Found log file entry"));
-      linfo->index_file_start_offset = offset;
-      linfo->index_file_offset = my_b_tell(&index_file);
-      break;
-    }
-    linfo->entry_index++;
-  }
+		// extend relative paths and match against full path
+		if (normalize_binlog_name(full_fname, fname, is_relay_log))
+		{
+			error = LOG_INFO_EOF;
+			break;
+		}
+		// if the log entry matches, null string matching anything
+		if (!log_name || !compare_log_name(full_fname, full_log_name))
+		{
+			DBUG_PRINT("info", ("Found log file entry"));
+			linfo->index_file_start_offset = offset;
+			linfo->index_file_offset = my_b_tell(&index_file);
+			break;
+		}
+		linfo->entry_index++;
+	}
 
 end:
-  if (need_lock_index) mysql_mutex_unlock(&LOCK_index);
-  return error;
+	if (need_lock_index) mysql_mutex_unlock(&LOCK_index);
+	return error;
 }
 
 /**

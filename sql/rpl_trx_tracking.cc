@@ -191,163 +191,177 @@ void Commit_order_trx_dependency_tracker::update_max_committed(
 }
 
 /**
-  Get the writeset dependencies of a transaction.
-  This takes the commit_parent that must be previously set using
-  Commit_order_trx_dependency_tracker and tries to make the commit_parent as
-  low as possible, using the writesets of each transaction.
-  The commit_parent returned depends on how many row hashes are stored in the
-  writeset_history, which is cleared once it reaches the user-defined maximum.
-
-  @param[in]     thd             Current THD from which to extract trx context.
-  @param[in,out] sequence_number Sequence number of current transaction.
-  @param[in,out] commit_parent   Commit_parent of current transaction,
-                                 pre-filled with the commit_parent calculated by
-                                 Commit_order_trx_dependency_tracker to use when
-                                 the writeset commit_parent is not valid.
-*/
-void Writeset_trx_dependency_tracker::get_dependency(THD *thd,
-                                                     int64 &sequence_number,
-                                                     int64 &commit_parent) {
-  Rpl_transaction_write_set_ctx *write_set_ctx =
-      thd->get_transaction()->get_transaction_write_set_ctx();
-  std::vector<uint64> *writeset = write_set_ctx->get_write_set();
+ * 获取一个事务的 writeset dependencies。
+ * 这需要先使用 Commit_order_trx_dependency_tracker 得到的 commit_parent，
+ * 使用每个事务的 writeset，使 commit_parent 尽可能的低。
+ * 
+ * 返回的 commit_parent 取决于 writeset_history 中存储了多少 row hases，
+ * 一旦达到用户定义的最大值，就会被清除。
+ * 
+ * @param[in]     thd             当前的 THD，从中提取 trx context.
+ * @param[in,out] sequence_number 当前事务的 Sequence number.
+ * @param[in,out] commit_parent   当前事务的 Commit_parent,
+ * 								  预填入了由 COMMIT_ORDER 的 get dependency 算出的 commit_parent
+ * 								  （以便在 WRITESET commit_parent 无效时降级使用）
+ */
+void
+Writeset_trx_dependency_tracker::get_dependency(THD *thd,
+												int64 &sequence_number,
+												int64 &commit_parent)
+{
+	// 获取当前 session 的 write_set
+  	Rpl_transaction_write_set_ctx *write_set_ctx =
+      	thd->get_transaction()->get_transaction_write_set_ctx();
+  	std::vector<uint64> *writeset = write_set_ctx->get_write_set();
 
 #ifndef NDEBUG
-  /* The writeset of an empty transaction must be empty. */
-  if (is_empty_transaction_in_binlog_cache(thd)) assert(writeset->size() == 0);
+	/* The writeset of an empty transaction must be empty. */
+	if (is_empty_transaction_in_binlog_cache(thd)) assert(writeset->size() == 0);
 #endif
 
-  /*
-    Check if this transaction has a writeset, if the writeset will overflow the
-    history size, if the transaction_write_set_extraction is consistent
-    between session and global or if changes in the tables referenced in this
-    transaction cascade to other tables. If that happens revert to using the
-    COMMIT_ORDER and clear the history to keep data consistent.
-  */
-  bool can_use_writesets =
-      // empty writeset implies DDL or similar, except if there are missing keys
-      (writeset->size() != 0 || write_set_ctx->get_has_missing_keys() ||
-       /*
-         The empty transactions do not need to clear the writeset history, since
-         they can be executed in parallel.
-       */
-       is_empty_transaction_in_binlog_cache(thd)) &&
-      // hashing algorithm for the session must be the same as used by other
-      // rows in history
-      (global_system_variables.transaction_write_set_extraction ==
-       thd->variables.transaction_write_set_extraction) &&
-      // must not use foreign keys
-      !write_set_ctx->get_has_related_foreign_keys() &&
-      // it did not broke past the capacity already
-      !write_set_ctx->was_write_set_limit_reached();
-  bool exceeds_capacity = false;
+	/**
+	 * 判断是否可以使用 write_set，主要关注：
+	 * 	- 这个事务是否有 writeset（DDL 或类似场景）;
+	 * 	- writeset 是否会溢出 history size;
+	 * 	- 当前 session 的 transaction_write_set_extraction(hash algo) 是否与 global(history)一致;
+	 * 	- 这个事务中引用的表所发生的修改是否是别的表的外键;
+	 * 如果发生上述情况，使用 COMMIT_ORDER，并清除 history 以保持数据的一致。
+ 	 */
+  	bool can_use_writesets =
+		// empty writeset 意味着 DDL 或类似情况，也就不能并行，除非有 missing keys
+		(writeset->size() != 0 || write_set_ctx->get_has_missing_keys()
+		// empty transactions 不需要清除 writeset history，因为它们可以并行地执行
+		|| is_empty_transaction_in_binlog_cache(thd))
+		// session 的 hashing algorithm 必须与 history 中其他行所使用的算法相同
+		&& (global_system_variables.transaction_write_set_extraction ==
+       			thd->variables.transaction_write_set_extraction)
+	    // 不可以使用外键
+		&& !write_set_ctx->get_has_related_foreign_keys()
+      	// 没有超出 capacity
+      	&& !write_set_ctx->was_write_set_limit_reached();
 
-  if (can_use_writesets) {
-    /*
-     Check if adding this transaction exceeds the capacity of the writeset
-     history. If that happens, m_writeset_history will be cleared only after
-     using its information for current transaction.
-    */
-    exceeds_capacity =
-        m_writeset_history.size() + writeset->size() > m_opt_max_history_size;
+	// write_history 的长度是否超过最大值
+	bool exceeds_capacity = false;
 
-    /*
-     Compute the greatest sequence_number among all conflicts and add the
-     transaction's row hashes to the history.
-    */
-    int64 last_parent = m_writeset_history_start;
-    for (std::vector<uint64>::iterator it = writeset->begin();
-         it != writeset->end(); ++it) {
-      Writeset_history::iterator hst = m_writeset_history.find(*it);
-      if (hst != m_writeset_history.end()) {
-        if (hst->second > last_parent && hst->second < sequence_number)
-          last_parent = hst->second;
+  	if (can_use_writesets)
+	{
+		/**
+		 * 检查如果添加该事务后，是否会超过了 writeset history 的容量。
+		 * 如果会超过，m_writeset_history 将在当前事务使用完其信息后才被清除。
+		 */
+    	exceeds_capacity =
+        	m_writeset_history.size() + writeset->size() > m_opt_max_history_size;
 
-        hst->second = sequence_number;
-      } else {
-        if (!exceeds_capacity)
-          m_writeset_history.insert(
-              std::pair<uint64, int64>(*it, sequence_number));
-      }
-    }
+		// 计算所有冲突中的最大的 sequence_number，并将该事务的 row hases 添加到 history 中
+		// 遍历 session 的 writeset，查找在 writeset_history 中的冲突行
+        //    - 如果冲突，则更新 last_parent（last_parent 是临时变量，并不是 commit parent）
+        //    - 如果没冲突，write_history 没找到最大值，则插入 write_history
+    	int64 last_parent = m_writeset_history_start;
+    	for (std::vector<uint64>::iterator it = writeset->begin();
+         	 it != writeset->end();
+			 ++it)
+		{
+      		Writeset_history::iterator hst = m_writeset_history.find(*it);
+      		if (hst != m_writeset_history.end())	// writeset_history 中存在
+			{
+        		if (hst->second > last_parent && hst->second < sequence_number)
+          			last_parent = hst->second;
 
-    /*
-      If the transaction references tables with missing primary keys revert to
-      COMMIT_ORDER, update and not reset history, as it is unnecessary because
-      any transaction that refers this table will also revert to COMMIT_ORDER.
-    */
-    if (!write_set_ctx->get_has_missing_keys()) {
-      /*
-       The WRITESET commit_parent then becomes the minimum of largest parent
-       found using the hashes of the row touched by the transaction and the
-       commit parent calculated with COMMIT_ORDER.
-      */
-      commit_parent = std::min(last_parent, commit_parent);
-    }
-  }
+        		hst->second = sequence_number;
+      		}
+			else	// writeset_history 中不存在
+			{
+        		if (!exceeds_capacity)	// 且当前没有超过 writeset history 的容量
+          			m_writeset_history.insert(std::pair<uint64, int64>(*it, sequence_number));
+      		}
+   		}
 
-  if (exceeds_capacity || !can_use_writesets) {
-    m_writeset_history_start = sequence_number;
-    m_writeset_history.clear();
-  }
+		/**
+		 * 如果事务引用了没有主键的表，则回退到 COMMIT_ORDER，
+		 * 这里是更新而不是重置 writeset history，
+		 * 因为任何引用这个表的事务也会恢复到 COMMIT_ORDER。
+		 */
+		if (!write_set_ctx->get_has_missing_keys())
+		{
+			/**
+			 * WRITESET 的 commit_parent 为
+			 * 	  - 事务所涉及的 row 的 hases 
+			 * 	  - COMMIT_ORDER 计算得到的 commit parent
+			 * 的最小值
+			 */
+			commit_parent = std::min(last_parent, commit_parent);
+		}
+  	}
+
+	// 如果 writeset_history 已满，或者不可以使用 WriteSet，则清空 WriteSet
+	if (exceeds_capacity || !can_use_writesets)
+	{
+		m_writeset_history_start = sequence_number;
+		m_writeset_history.clear();
+	}
 }
 
 void Writeset_trx_dependency_tracker::rotate(int64 start) {
-  m_writeset_history_start = start;
-  m_writeset_history.clear();
+	m_writeset_history_start = start;
+	m_writeset_history.clear();
 }
 
 /**
-  Get the writeset commit parent of transactions using the session dependencies.
+ * 根据 session dependencies 获取事务的 writeset commit parent
+ * @param[in]     thd             Current THD from which to extract trx context.
+ * @param[in,out] sequence_number Sequence number of current transaction.
+ * @param[in,out] commit_parent   Commit_parent of current transaction,
+                                  pre-filled with the commit_parent calculated
+                                  by the Write_set_trx_dependency_tracker as a
+                                  fall-back.
+ */
+void
+Writeset_session_trx_dependency_tracker::get_dependency(
+    	THD *thd,
+		int64 &sequence_number,
+		int64 &commit_parent)
+{
+  	int64 session_parent = thd->rpl_thd_ctx
+	  							.dependency_tracker_ctx()
+                             	.get_last_session_sequence_number();
 
-  @param[in]     thd             Current THD from which to extract trx context.
-  @param[in,out] sequence_number Sequence number of current transaction.
-  @param[in,out] commit_parent   Commit_parent of current transaction,
-                                 pre-filled with the commit_parent calculated
-                                 by the Write_set_trx_dependency_tracker as a
-                                 fall-back.
-*/
-void Writeset_session_trx_dependency_tracker::get_dependency(
-    THD *thd, int64 &sequence_number, int64 &commit_parent) {
-  int64 session_parent = thd->rpl_thd_ctx.dependency_tracker_ctx()
-                             .get_last_session_sequence_number();
+  	if (session_parent != 0 && session_parent < sequence_number)
+    	commit_parent = std::max(commit_parent, session_parent);
 
-  if (session_parent != 0 && session_parent < sequence_number)
-    commit_parent = std::max(commit_parent, session_parent);
-
-  thd->rpl_thd_ctx.dependency_tracker_ctx().set_last_session_sequence_number(
-      sequence_number);
+  	thd->rpl_thd_ctx.dependency_tracker_ctx()
+	  				.set_last_session_sequence_number(sequence_number);
 }
 
 /**
-  Get the dependencies in a transaction, the main entry point for the
-  dependency tracking work.
-*/
+ * 获取事务中的依赖关系，这是 dependency tracking 的主要入口。
+ */
 void Transaction_dependency_tracker::get_dependency(THD *thd,
                                                     int64 &sequence_number,
-                                                    int64 &commit_parent) {
-  sequence_number = commit_parent = 0;
+                                                    int64 &commit_parent)
+{
+  	sequence_number = commit_parent = 0;
 
-  switch (m_opt_tracking_mode) {
-    case DEPENDENCY_TRACKING_COMMIT_ORDER:
-      m_commit_order.get_dependency(thd, sequence_number, commit_parent);
-      break;
-    case DEPENDENCY_TRACKING_WRITESET:
-      m_commit_order.get_dependency(thd, sequence_number, commit_parent);
-      m_writeset.get_dependency(thd, sequence_number, commit_parent);
-      break;
-    case DEPENDENCY_TRACKING_WRITESET_SESSION:
-      m_commit_order.get_dependency(thd, sequence_number, commit_parent);
-      m_writeset.get_dependency(thd, sequence_number, commit_parent);
-      m_writeset_session.get_dependency(thd, sequence_number, commit_parent);
-      break;
-    default:
-      assert(0);  // blow up on debug
-      /*
-        Fallback to commit order on production builds.
-       */
-      m_commit_order.get_dependency(thd, sequence_number, commit_parent);
-  }
+  	switch (m_opt_tracking_mode)
+	{
+    	case DEPENDENCY_TRACKING_COMMIT_ORDER:
+			// COMMIT_ORDER 模式只调用 m_commit_order.get_dependency()
+			m_commit_order.get_dependency(thd, sequence_number, commit_parent);
+			break;
+		case DEPENDENCY_TRACKING_WRITESET:
+			m_commit_order.get_dependency(thd, sequence_number, commit_parent);
+			m_writeset.get_dependency(thd, sequence_number, commit_parent);
+			break;
+		case DEPENDENCY_TRACKING_WRITESET_SESSION:
+			m_commit_order.get_dependency(thd, sequence_number, commit_parent);
+			m_writeset.get_dependency(thd, sequence_number, commit_parent);
+			m_writeset_session.get_dependency(thd, sequence_number, commit_parent);
+			break;
+		default:
+			assert(0);  // debug build 下直接崩溃
+			
+			// 在 produnction build 下回退到 COMMIT_ORDER 模式
+			m_commit_order.get_dependency(thd, sequence_number, commit_parent);
+  	}
 }
 
 void Transaction_dependency_tracker::tracking_mode_changed() {

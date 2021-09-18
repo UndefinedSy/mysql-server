@@ -1002,6 +1002,10 @@ bool Gtid_set::is_interval_subset(Const_interval_iterator *sub,
 		find the first super-interval that does not end before sub_iv,
 		check if it covers sub_iv.
 	*/
+	// 算法:
+	// sub_iv 会在 sub 的 intervals 内迭代。
+	// 对于每个 sub_iv，跳过在 sub_iv 之前就已结束的 super 的 intervals。
+	// 当我们找到第一个不在 sub_iv 之前结束的 super-interval 时，检查它是否覆盖了 sub_iv。
 	do {
 		if (super_iv == nullptr) return false;
 

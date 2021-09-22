@@ -1111,6 +1111,7 @@ Slave_worker *get_least_occupied_worker(Relay_log_info *rli,
 }
 
 /**
+ * 当一个 group 执行完或者异常终止时会调用
    Deallocation routine to cancel out few effects of
    @c map_db_to_worker().
    Involved into processing of the group APH tuples are updated.
@@ -1470,55 +1471,63 @@ ulong Slave_committed_queue::move_queue_head(Slave_worker_array *ws) {
 }
 
 /**
-   Finds low-water mark of committed jobs in GAQ.
-   That is an index below which all jobs are marked as done.
+ * 查找 GAQ 中 committed jobs 的 low-water-mark
+ * lwm 是一个 index，在该 index 之后的所有 jobs 都标记为 done
+ *
+ * 需要注意的是，当 queue 中没有任何未完成的 job 时，会返回第一个可用的 index
+ * 这包括 empty queue 和 full of complete jobs queue 的场景
+ * 
+ * 调用者需要持有 mutex，以避免并发的来自 Coordinator 的 move_queue_head() 修改 LWM
+ * 
+ * @param [out] arg_g  一个指向指针的指针
+ * 					   指向最后一个被标记为 done-as-true 的 Slave job descriptor item
+ * @param start_index  标识开始搜索的 GAQ index
+ * 					   调用者要确保该索引指向了 GAQ 环形缓冲区的 assigned range
+ * @return             找到的最后一个连续的 done job 的 GAQ index
+ * 					   若未找到则返回 GAQ size
+ */
+ulong
+Slave_committed_queue::find_lwm(Slave_job_group **arg_g,
+								ulong start_index)
+{
+	Slave_job_group *ptr_g = nullptr;
+	ulong i, k, cnt;
 
-   Notice the first available index is returned when the queue
-   does not have any incomplete jobs. That includes cases of
-   the empty and the full of complete jobs queue.
-   A mutex protecting from concurrent LWM change by
-   move_queue_head() (by Coordinator) should be taken by the caller.
+  	assert(start_index <= size);
 
-   @param [out] arg_g  a double pointer to Slave job descriptor item
-                       last marked with done-as-true boolean.
-   @param start_index  a GAQ index to start/resume searching.
-                       Caller is to make sure the index points into
-                       assigned (occupied) range of circular buffer of GAQ.
-   @return             GAQ index of the last consecutive done job, or the GAQ
-                       size when none is found.
-*/
-ulong Slave_committed_queue::find_lwm(Slave_job_group **arg_g,
-                                      ulong start_index) {
-  Slave_job_group *ptr_g = nullptr;
-  ulong i, k, cnt;
+  	if (empty()) return size;
 
-  assert(start_index <= size);
+	/*
+		Loop continuation condition relies on
+		(TODO: assert it)
+		the start_index being in the running range:
 
-  if (empty()) return size;
+		start_index \in [entry, avail - 1].
 
-  /*
-    Loop continuation condition relies on
-    (TODO: assert it)
-    the start_index being in the running range:
+		It satisfies any queue size including 1.
+		It does not satisfy the empty queue case which is bailed out earlier above.
+	*/
+	// 循环继续的条件依赖于 start_index 在 running range 内:
+	// 		start_index ∈ [entry, avail - 1]
+	// 这满足任何 queue size，包括 1
+	// 这并不满足上面早提到的 empty queue 的情况
+	for (i = start_index, cnt = 0;
+		 cnt < len - (start_index + size - entry) % size;
+		 i = (i + 1) % size, cnt++)
+	{
+		ptr_g = &m_Q[i];
+		if (ptr_g->done.load() == 0)
+		{
+			// queue 的第一个节点就没有 done，此时返回 GAQ size
+			if (cnt == 0) return size;
 
-       start_index \in [entry, avail - 1].
+			break;
+		}
+	}
+	ptr_g = &m_Q[k = (i + size - 1) % size];
+	*arg_g = ptr_g;
 
-    It satisfies any queue size including 1.
-    It does not satisfy the empty queue case which is bailed out earlier above.
-  */
-  for (i = start_index, cnt = 0;
-       cnt < len - (start_index + size - entry) % size;
-       i = (i + 1) % size, cnt++) {
-    ptr_g = &m_Q[i];
-    if (ptr_g->done.load() == 0) {
-      if (cnt == 0) return size;  // the first node of the queue is not done
-      break;
-    }
-  }
-  ptr_g = &m_Q[k = (i + size - 1) % size];
-  *arg_g = ptr_g;
-
-  return k;
+	return k;
 }
 
 /**
@@ -1670,58 +1679,60 @@ static int64 get_sequence_number(Log_event *ev) {
 #endif
 
 /**
-  MTS worker main routine.
-  The worker thread loops in waiting for an event, executing it and
-  fixing statistics counters.
+ * MTS worker main routine.
+ * Worker thread 会循环等待 event，执行收到的 event 并修正统计计数器
+ * @return 0 success
+ *         -1 被 kill 或者在 applying 的过程中出错
+ */
+int Slave_worker::slave_worker_exec_event(Log_event *ev)
+{
+	Relay_log_info *rli = c_rli;
+	THD *thd = info_thd;
+	int ret = 0;
 
-  @return 0 success
-         -1 got killed or an error happened during applying
-*/
-int Slave_worker::slave_worker_exec_event(Log_event *ev) {
-  Relay_log_info *rli = c_rli;
-  THD *thd = info_thd;
-  int ret = 0;
+	DBUG_TRACE;
 
-  DBUG_TRACE;
-
-  thd->server_id = ev->server_id;
-  thd->set_time();
-  thd->lex->set_current_query_block(nullptr);
-  if (!ev->common_header->when.tv_sec)
-    ev->common_header->when.tv_sec = static_cast<long>(my_time(0));
-  ev->thd = thd;  // todo: assert because up to this point, ev->thd == 0
-  ev->worker = this;
+	thd->server_id = ev->server_id;
+	thd->set_time();
+	thd->lex->set_current_query_block(nullptr);
+	if (!ev->common_header->when.tv_sec)
+    	ev->common_header->when.tv_sec = static_cast<long>(my_time(0));
+	ev->thd = thd;  // todo: assert because up to this point, ev->thd == 0
+	ev->worker = this;
 
 #ifndef NDEBUG
-  if (!is_mts_db_partitioned(rli) && may_have_timestamp(ev) &&
-      !curr_group_seen_sequence_number) {
-    curr_group_seen_sequence_number = true;
+  	if (!is_mts_db_partitioned(rli)
+	    && may_have_timestamp(ev)
+		&& !curr_group_seen_sequence_number)
+	{
+    	curr_group_seen_sequence_number = true;
 
-    longlong lwm_estimate =
-        static_cast<Mts_submode_logical_clock *>(rli->current_mts_submode)
-            ->estimate_lwm_timestamp();
-    int64 last_committed = get_last_committed(ev);
-    int64 sequence_number = get_sequence_number(ev);
-    /*
-      The commit timestamp waiting condition:
+		longlong lwm_estimate =
+			static_cast<Mts_submode_logical_clock *>(rli->current_mts_submode)
+				->estimate_lwm_timestamp();
+		int64 last_committed = get_last_committed(ev);
+		int64 sequence_number = get_sequence_number(ev);
+		/**
+		 * The commit timestamp waiting condition:
+		 *
+		 *	lwm_estimate < last_committed  <=>  last_committed  \not <= lwm_estimate
+		 *
+		 * must have been satisfied by Coordinator.
+		 * The first scheduled transaction does not have to wait for anybody.
+		 */
+		assert(rli->gaq->entry == ev->mts_group_idx
+			   || Mts_submode_logical_clock::clock_leq(last_committed, lwm_estimate));
+		assert(lwm_estimate != SEQ_UNINIT
+			   || rli->gaq->entry == ev->mts_group_idx);
 
-        lwm_estimate < last_committed  <=>  last_committed  \not <= lwm_estimate
-
-      must have been satisfied by Coordinator.
-      The first scheduled transaction does not have to wait for anybody.
-    */
-    assert(rli->gaq->entry == ev->mts_group_idx ||
-           Mts_submode_logical_clock::clock_leq(last_committed, lwm_estimate));
-    assert(lwm_estimate != SEQ_UNINIT || rli->gaq->entry == ev->mts_group_idx);
-    /*
-      The current transaction's timestamp can't be less that lwm.
-    */
-    assert(sequence_number == SEQ_UNINIT ||
-           !Mts_submode_logical_clock::clock_leq(
-               sequence_number, static_cast<Mts_submode_logical_clock *>(
-                                    rli->current_mts_submode)
-                                    ->estimate_lwm_timestamp()));
-  }
+		// The current transaction's timestamp can't be less that lwm.
+		assert(sequence_number == SEQ_UNINIT
+			   || !Mts_submode_logical_clock::clock_leq(
+						sequence_number,
+						static_cast<Mts_submode_logical_clock *>(
+										rli->current_mts_submode)
+										->estimate_lwm_timestamp()));
+	}
 #endif
 
   // Address partioning only in database mode

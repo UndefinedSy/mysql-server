@@ -1142,6 +1142,8 @@ class Relay_log_info : public Rpl_info {
     master-binlog ordered queue of Slave_job_group descriptors of groups
     that are under processing. The queue size is @c checkpoint_group.
   */
+  // 正在执行的 groups 的 Slave_job_group 描述符的 master-binlog ordered queue。
+  // queue size 为 @c checkpoint_group。
   Slave_committed_queue *gaq;
   /*
     Container for references of involved partitions for the current event group

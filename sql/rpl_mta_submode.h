@@ -131,6 +131,8 @@ class Mts_submode_logical_clock : public Mts_submode {
   bool is_new_group;
   uint delegated_jobs;
   /* "instant" value of committed transactions low-water-mark */
+  // 这个值只在 get_lwm_timestamp 中被更新
+  // 而 get_lwm_timestamp 会在 slave_worker_ends_group 中被调用
   std::atomic<longlong> last_lwm_timestamp;
   /* GAQ index corresponding to the min commit point */
   ulong last_lwm_index;
@@ -184,24 +186,25 @@ class Mts_submode_logical_clock : public Mts_submode {
                                  Slave_worker *ignore = nullptr) override;
   bool wait_for_last_committed_trx(Relay_log_info *rli,
                                    longlong last_committed_arg);
-  /*
-    LEQ comparison of two logical timestamps follows regular rules for
-    integers. SEQ_UNINIT is regarded as the least value in the clock domain.
-
-    @param a  the lhs logical timestamp value
-    @param b  the rhs logical timestamp value
-
-    @return   true  when a "<=" b,
-              false otherwise
-  */
-  static bool clock_leq(longlong a, longlong b) {
-    if (a == SEQ_UNINIT)
-      return true;
-    else if (b == SEQ_UNINIT)
-      return false;
-    else
-      return a <= b;
-  }
+	/**
+	 * 两个逻辑时间戳的 LEQ comparison（<=）遵循整数的规则。
+	 * SEQ_UNINIT 被认为是时钟域中的最小值。
+	 * 
+	 * @param a  the lhs logical timestamp value
+	 * @param b  the rhs logical timestamp value
+	 * 
+	 * @return   true  when a "<=" b,
+	 *           false otherwise
+	 */
+	static bool clock_leq(longlong a, longlong b)
+	{
+		if (a == SEQ_UNINIT)
+			return true;
+		else if (b == SEQ_UNINIT)
+			return false;
+		else
+			return a <= b;
+	}
 
   longlong get_lwm_timestamp(Relay_log_info *rli, bool need_lock);
   longlong estimate_lwm_timestamp() { return last_lwm_timestamp.load(); }

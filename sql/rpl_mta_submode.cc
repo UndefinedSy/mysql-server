@@ -435,376 +435,419 @@ Mts_submode_logical_clock::Mts_submode_logical_clock() {
 }
 
 /**
-   The method finds the minimum logical timestamp (low-water-mark) of
-   committed transactions.
-   The successful search results in a pair of a logical timestamp value and a
-   GAQ index that contains it. last_lwm_timestamp may still be raised though the
-   search does not find any satisfying running index. Search is implemented as
-   headway scanning of GAQ from a point of a previous search's stop position
-   (last_lwm_index). Whether the cached (memorized) index value is considered to
-   be stale when its timestamp gets less than the current "stable" LWM:
+ * 这个方法会找到 committed 事务的最小 logical timestamp(low-water-mark/lwm)
+ * 
+ * successful search results 是一个 pair:
+ * - 一个 logical timestamp
+ * - 一个 包含该它的 GAQ index（???包含 logical timestamp?）
+ * 尽管搜索没有找到任何满足的 running index，last_lwm_timestamp 仍然可能被提出(raised)
+ * 搜索是以 GAQ 的 headway scanning 方式实现的，接着上一次搜索的停止位置（last_lwm_index）开始。
+ * 当 cached index value 的时间戳小于当前 stable LWM 时，是否被认为是 stale 的:
+ * (Whether the cached (memorized) index value is considered to
+ *  be stale when its timestamp gets less than the current "stable" LWM)
+ *
+ *       last_lwm_timestamp <= GAQ.lwm.sequence_number           (*)
+ *
+ * Staleness 是由 GAQ 的垃圾回收所引起的，它增加了(*)的 rhs，
+ * 见 @c move_queue_head()
+ * 当发现这一点时，对 GAQ 的搜索需要从队列尾部重新开始。
+ * 
+ * 从形式上看，last_lwm_timestamp 的未定义的 cached value 也是 stale
+ *
+ * @verbatim
+ * 			  包含有 lwm 的 last time index
+ *                +------+
+ *                | LWM  |
+ *                |  |   |
+ *                V  V   V
+ * GAQ:   xoooooxxxxxXXXXX...X
+ *              ^   ^
+ *              |   | LWM+1
+ *              |
+ *              +- tne new current_lwm
+ *
+ *          <---- logical (commit) time 前进方向 ----
+ * @endverbatim
+ * 
+ * - `x` 代表 committed
+ * - `X` 代表 committed 并已从队列的 running range 中丢弃
+ * - `o` 代表 not committed
+ * 
+ * @param  rli         Relay_log_info pointer
+ * @param  need_lock   调用者或者该函数必须持有 mutex
+ * 
+ * @return possibly updated current_lwm
+ */
+longlong
+Mts_submode_logical_clock::get_lwm_timestamp(Relay_log_info *rli,
+											 bool need_lock)
+{
+	longlong lwm_estim;
+	Slave_job_group *ptr_g = nullptr;
+	bool is_stale = false;
 
-        last_lwm_timestamp <= GAQ.lwm.sequence_number           (*)
+	if (!need_lock) mysql_mutex_lock(&rli->mts_gaq_LOCK);
 
-   Staleness is caused by GAQ garbage collection that increments the rhs of (*),
-   see @c move_queue_head(). When that's diagnosed, the search in GAQ needs
-   restarting from the queue tail.
+	/*
+		Make the "stable" LWM-based estimate which will be compared
+		against the cached "instant" value.
+	*/
+	// "stable" LWM-based 估计值，该值以会与 cached "instant" value 进行比较
+	lwm_estim = rli->gaq->lwm.sequence_number;
 
-   Formally, the undefined cached value of last_lwm_timestamp is also stale.
+	/*
+		timestamp continuity invariant: if the queue has any item
+		its timestamp is greater on one than the estimate.
+	*/
+	// 时间戳的连续性不变：如果队列中有任何 item，其时间戳应该比估计值大 1
+  	assert(lwm_estim == SEQ_UNINIT || rli->gaq->empty()
+	   	   || lwm_estim + 1 == rli->gaq->get_job_group(rli->gaq->entry)->sequence_number);
 
-   @verbatim
-              the last time index containg lwm
-                  +------+
-                  | LWM  |
-                  |  |   |
-                  V  V   V
-   GAQ:   xoooooxxxxxXXXXX...X
-                ^   ^
-                |   | LWM+1
-                |
-                +- tne new current_lwm
+  	last_lwm_index = rli->gaq->find_lwm(
+      	&ptr_g,
+		/*
+			The underfined "stable" forces the scan's restart
+			as the stale value does.
+		*/
+		// 未定义的 "stable" 和 stale value 会使得 scan 重新开始
+		lwm_estim == SEQ_UNINIT	// stable estimate 是一个未定义的值
+		|| (is_stale = clock_leq(last_lwm_timestamp, lwm_estim)) // 记录的 last_lwm_timestamp 滞后了
+			? rli->gaq->entry	// 若滞后了则用 queue head
+			: last_lwm_index);	// 否则使用上一次搜索结束的 index
+	/*
+		if the returned index is sane update the timestamp.
+	*/
+	// 找到了 committed jobs 的 low-water-mark
+  	if (last_lwm_index != rli->gaq->size)
+	{
+		// non-decreasing lwm invariant
+		assert(clock_leq(last_lwm_timestamp, ptr_g->sequence_number));
 
-         <---- logical (commit) time ----
-   @endverbatim
+		last_lwm_timestamp = ptr_g->sequence_number;
+  	}
+	// 未找到 committed job，且之前判断出 last_lwm_timestamp 滞后了
+	else if (is_stale)
+	{
+    	last_lwm_timestamp.store(lwm_estim);
+  	}
 
-   here `x' stands for committed, `X' for committed and discarded from
-   the running range of the queue, `o' for not committed.
+  	if (!need_lock) mysql_mutex_unlock(&rli->mts_gaq_LOCK);
 
-   @param  rli         Relay_log_info pointer
-   @param  need_lock   Either the caller or the function must hold a mutex
-                       to avoid race with concurrent GAQ update.
-
-   @return possibly updated current_lwm
-*/
-longlong Mts_submode_logical_clock::get_lwm_timestamp(Relay_log_info *rli,
-                                                      bool need_lock) {
-  longlong lwm_estim;
-  Slave_job_group *ptr_g = nullptr;
-  bool is_stale = false;
-
-  if (!need_lock) mysql_mutex_lock(&rli->mts_gaq_LOCK);
-
-  /*
-    Make the "stable" LWM-based estimate which will be compared
-    against the cached "instant" value.
-  */
-  lwm_estim = rli->gaq->lwm.sequence_number;
-  /*
-    timestamp continuity invariant: if the queue has any item
-    its timestamp is greater on one than the estimate.
-  */
-  assert(lwm_estim == SEQ_UNINIT || rli->gaq->empty() ||
-         lwm_estim + 1 ==
-             rli->gaq->get_job_group(rli->gaq->entry)->sequence_number);
-
-  last_lwm_index = rli->gaq->find_lwm(
-      &ptr_g,
-      /*
-        The underfined "stable" forces the scan's restart
-        as the stale value does.
-      */
-      lwm_estim == SEQ_UNINIT ||
-              (is_stale = clock_leq(last_lwm_timestamp, lwm_estim))
-          ? rli->gaq->entry
-          : last_lwm_index);
-  /*
-    if the returned index is sane update the timestamp.
-  */
-  if (last_lwm_index != rli->gaq->size) {
-    // non-decreasing lwm invariant
-    assert(clock_leq(last_lwm_timestamp, ptr_g->sequence_number));
-
-    last_lwm_timestamp = ptr_g->sequence_number;
-  } else if (is_stale) {
-    last_lwm_timestamp.store(lwm_estim);
-  }
-
-  if (!need_lock) mysql_mutex_unlock(&rli->mts_gaq_LOCK);
-
-  return last_lwm_timestamp;
+  	return last_lwm_timestamp;
 }
 
 /**
-   The method implements logical timestamp conflict detection
-   and resolution through waiting by the calling thread.
-   The conflict or waiting condition is like the following
+ * 该方法通过让调用线程等待，实现了 logical timestamp 的冲突检测和解决
+ * conflict 或 waiting condition 如下:
+ *		lwm < last_committed,
+ *
+ * 其中 lwm 是 committed 事务中的最小 logical timestamp
+ * 由于 lwm 的精确值并不总是可用的，它的悲观估计（一个旧版本）被改进:
+ * get_lwm_timestamp() 作为实际等待 commitment 前的第一步
+ *
+ * 特例包括:
+ * - 当 last_committed_arg 未被初始化时，
+ * 	 调用线程必须继续进行而不会等待任何人。
+ *   任何 unknown commit parent transaction 可能的依赖关系都应由 parent 来解决。
+ *
+ * - 当 GAQ index 在最后一个 lwm index 之后时，
+ * 	 若当前事务时 SEQ_UNINIT，则无论 lwm timestamp 是什么，当前事务都不会有 dependency
+ *   因此，当 GAQ 只由一个 item 时，则不需要等待。这种情况留给调用者来处理。
+ *
+ * @note 调用者必须确保当前事务不会 waiting 自己。
+ * 		 也就是说，该方法不应该被一个 group assignment 在 GAQ front item 的 Worker所调用
+ * 
+ * @param rli relay log info of coordinator
+ * @param last_committed_arg 一个 parent transaction 的 logical timestamp
+ *							 这里是 incoming 事务的 last_committed
+ * @return false as success,
+ *         true  当 error flag 被设置或者
+ *               调用的 thread 已经被 kill
+ */
+bool
+Mts_submode_logical_clock::wait_for_last_committed_trx(
+    	Relay_log_info *rli,
+		longlong last_committed_arg)	// the incoming last_commited
+{
+	THD *thd = rli->info_thd;
 
-           lwm < last_committed,
+	DBUG_TRACE;
 
-   where lwm is a minimum logical timestamp of committed transactions.
-   Since the lwm's exact value is not always available its pessimistic
-   estimate (an old version) is improved (get_lwm_timestamp()) as the
-   first step before to the actual waiting commitment.
+	// ???讲道理不会走到这里，真是 0 外层就作为 new group 了，所以这是组撒的
+	if (last_committed_arg == SEQ_UNINIT) return false;
 
-   Special cases include:
+	mysql_mutex_lock(&rli->mts_gaq_LOCK);
 
-   When @c last_committed_arg is uninitialized the calling thread must
-   proceed without waiting for anyone. Any possible dependency with unknown
-   commit parent transaction shall be sorted out by the parent;
+	assert(min_waited_timestamp == SEQ_UNINIT);
 
-   When the gaq index is subsequent to the last lwm index
-   there's no dependency of the current transaction with any regardless of
-   lwm timestamp should it be SEQ_UNINIT.
-   Consequently when GAQ consists of just one item there's none to wait.
-   Such latter case is left to the caller to handle.
+	min_waited_timestamp.store(last_committed_arg);
+	/*
+		This transaction is a candidate for insertion into the waiting list.
+		That fact is descibed by incrementing waited_timestamp_cnt.
+		When the candidate won't make it the counter is decremented at once
+		while the mutex is hold.
+	*/
+	// 此事务是插入 waiting list 的候选者。
+	// 这是通过递增 waited_timestamp_cnt 来描述的。
+	// 当这个候选者不能进入时，计数器会被一次性递减，同时 mutex 被保留。
+  	if ((!rli->info_thd->killed && !is_error)
+	    && !clock_leq(last_committed_arg, get_lwm_timestamp(rli, true)))	// last_committed > ?
+	{
+		PSI_stage_info old_stage;
+		struct timespec ts[2];
+		set_timespec_nsec(&ts[0], 0);
 
-   @note The caller must make sure the current transaction won't be waiting
-         for itself. That is the method should not be caller by a Worker
-         whose group assignment is in the GAQ front item.
+		assert(rli->gaq->len >= 2);  // there's someone to wait
 
-   @param rli relay log info of coordinator
-   @param last_committed_arg  logical timestamp of a parent transaction
-   @return false as success,
-           true  when the error flag is raised or
-                 the caller thread is found killed.
-*/
-bool Mts_submode_logical_clock::wait_for_last_committed_trx(
-    Relay_log_info *rli, longlong last_committed_arg) {
-  THD *thd = rli->info_thd;
+		thd->ENTER_COND(&rli->logical_clock_cond,	// the condition to wait on
+						&rli->mts_gaq_LOCK,	// the associated mutex
+						&stage_worker_waiting_for_commit_parent,	// the new stage to enter
+						&old_stage);	// the previous stage
+		do {
+			mysql_cond_wait(&rli->logical_clock_cond, &rli->mts_gaq_LOCK);
+		} while ((!rli->info_thd->killed && !is_error)
+				 && !clock_leq(last_committed_arg, estimate_lwm_timestamp()));	// last_committed > lwm 时等待
 
-  DBUG_TRACE;
+		min_waited_timestamp.store(SEQ_UNINIT);  // reset waiting flag
+		mysql_mutex_unlock(&rli->mts_gaq_LOCK);
+		thd->EXIT_COND(&old_stage);
+		set_timespec_nsec(&ts[1], 0);
+		rli->mts_total_wait_overlap += diff_timespec(&ts[1], &ts[0]);
+	}
+	else
+	{
+		min_waited_timestamp.store(SEQ_UNINIT);
+		mysql_mutex_unlock(&rli->mts_gaq_LOCK);
+	}
 
-  if (last_committed_arg == SEQ_UNINIT) return false;
-
-  mysql_mutex_lock(&rli->mts_gaq_LOCK);
-
-  assert(min_waited_timestamp == SEQ_UNINIT);
-
-  min_waited_timestamp.store(last_committed_arg);
-  /*
-    This transaction is a candidate for insertion into the waiting list.
-    That fact is descibed by incrementing waited_timestamp_cnt.
-    When the candidate won't make it the counter is decremented at once
-    while the mutex is hold.
-  */
-  if ((!rli->info_thd->killed && !is_error) &&
-      !clock_leq(last_committed_arg, get_lwm_timestamp(rli, true))) {
-    PSI_stage_info old_stage;
-    struct timespec ts[2];
-    set_timespec_nsec(&ts[0], 0);
-
-    assert(rli->gaq->len >= 2);  // there's someone to wait
-
-    thd->ENTER_COND(&rli->logical_clock_cond, &rli->mts_gaq_LOCK,
-                    &stage_worker_waiting_for_commit_parent, &old_stage);
-    do {
-      mysql_cond_wait(&rli->logical_clock_cond, &rli->mts_gaq_LOCK);
-    } while ((!rli->info_thd->killed && !is_error) &&
-             !clock_leq(last_committed_arg, estimate_lwm_timestamp()));
-    min_waited_timestamp.store(SEQ_UNINIT);  // reset waiting flag
-    mysql_mutex_unlock(&rli->mts_gaq_LOCK);
-    thd->EXIT_COND(&old_stage);
-    set_timespec_nsec(&ts[1], 0);
-    rli->mts_total_wait_overlap += diff_timespec(&ts[1], &ts[0]);
-  } else {
-    min_waited_timestamp.store(SEQ_UNINIT);
-    mysql_mutex_unlock(&rli->mts_gaq_LOCK);
-  }
-
-  return rli->info_thd->killed || is_error;
+  	return rli->info_thd->killed || is_error;
 }
 
 /**
- Does necessary arrangement before scheduling next event.
- The method computes the meta-group status of the being scheduled
- transaction represented by the event argument. When the status
- is found OUT (of the current meta-group) as encoded as is_new_group == true
- the global Scheduler (Coordinator thread) requests full synchronization
- with all Workers.
- The current being assigned group descriptor gets associated with
- the group's logical timestamp aka sequence_number.
-
- @return ER_MTS_CANT_PARALLEL, ER_MTS_INCONSISTENT_DATA
-          0 if no error or slave has been killed gracefully
+ * 该方法计算参数 ev 所代表的欲调度的事务的 meta-group status
+ * 当发现状态为 OUT（当前 meta-group）时，编码为 is_new_group == true，
+ * global Scheduler（Coordinator thread）请求与所有 Worker full synchronization
+ *
+ * 当前正在分配的 group descriptor 与该 group 的逻辑时间戳（sequence_number）有关
+ * 
+ * 在 Mts_submode_logical_clock 中存储了回放事务中
+ * - 已经提交事务 logical timestamp
+ * 		- last_committed
+ * 		- sequence_number
+ * - low-water-mark(lwm) last_lwm_timestamp
+ * 		> low-water-mark 表示该事务已经提交，同时该事务之前的事务都已经提交。
+ *
+ * @return ER_MTS_CANT_PARALLEL, ER_MTS_INCONSISTENT_DATA
+ *         0 如果没有错误，或者 slave 被优雅地 kill
  */
 int Mts_submode_logical_clock::schedule_next_event(Relay_log_info *rli,
-                                                   Log_event *ev) {
-  longlong last_sequence_number = sequence_number;
-  bool gap_successor = false;
+                                                   Log_event *ev)
+{
+	longlong last_sequence_number = sequence_number;
+	bool gap_successor = false;
 
-  DBUG_TRACE;
-  // We should check if the SQL thread was already killed before we schedule
-  // the next transaction
-  if (sql_slave_killed(rli->info_thd, rli)) return 0;
+	DBUG_TRACE;
+	// We should check if the SQL thread was already killed before we schedule
+	// the next transaction
+	if (sql_slave_killed(rli->info_thd, rli)) return 0;
 
-  Slave_job_group *ptr_group =
-      rli->gaq->get_job_group(rli->gaq->assigned_group_index);
-  /*
-    A group id updater must satisfy the following:
-    - A query log event ("BEGIN" ) or a GTID EVENT
-    - A DDL or an implicit DML commit.
-  */
-  switch (ev->get_type_code()) {
-    case binary_log::GTID_LOG_EVENT:
-    case binary_log::ANONYMOUS_GTID_LOG_EVENT:
-      // TODO: control continuity
-      ptr_group->sequence_number = sequence_number =
-          static_cast<Gtid_log_event *>(ev)->sequence_number;
-      ptr_group->last_committed = last_committed =
-          static_cast<Gtid_log_event *>(ev)->last_committed;
-      break;
+	Slave_job_group *ptr_group =
+		rli->gaq->get_job_group(rli->gaq->assigned_group_index);
+	/*
+		group ID updater 必须满足以下情况:
+		- 一个 query log event("BEGIN") 或者是一个 GTID EVENT
+		- 一个 DDL 或者一个隐式的 DML commit
+	*/
+  	switch (ev->get_type_code())
+	{
+    	case binary_log::GTID_LOG_EVENT:
+    	case binary_log::ANONYMOUS_GTID_LOG_EVENT:
+      		// TODO: control continuity
+      		ptr_group->sequence_number = sequence_number =
+          		static_cast<Gtid_log_event *>(ev)->sequence_number;
+      		ptr_group->last_committed = last_committed =
+          		static_cast<Gtid_log_event *>(ev)->last_committed;
+      		break;
 
-    default:
+    	default:
+			sequence_number = last_committed = SEQ_UNINIT;
+			break;
+  	}
 
-      sequence_number = last_committed = SEQ_UNINIT;
+  	DBUG_PRINT("info", ("sequence_number %lld, last_committed %lld",
+                       sequence_number, last_committed));
 
-      break;
-  }
+  	if (first_event)	// 组撒的？
+	{
+    	first_event = false;
+  	}
+	else
+	{
+		// sequnce_num <= last_committed && last_committed != 0
+		// ??? 这怎么了
+		if (unlikely(clock_leq(sequence_number, last_committed)
+			&& last_committed != SEQ_UNINIT))
+		{
+			/* inconsistent (buggy) timestamps */
+			LogErr(ERROR_LEVEL, ER_RPL_INCONSISTENT_TIMESTAMPS_IN_TRX,
+					sequence_number, last_committed);
+			return ER_MTS_CANT_PARALLEL;
+		}
+		// sequence_number <= last_sequence_number && sequence_number != 0
+		// last_sequence_number 看起来是当前的 logical clock 的 sequence num
+		if (unlikely(clock_leq(sequence_number, last_sequence_number)
+			&& sequence_number != SEQ_UNINIT))
+		{
+			/* inconsistent (buggy) timestamps */
+			LogErr(ERROR_LEVEL, ER_RPL_INCONSISTENT_SEQUENCE_NO_IN_TRX,
+					sequence_number, last_sequence_number);
+			return ER_MTS_CANT_PARALLEL;
+		}
+		/*
+			正在被调度的事务序列可能有 gaps，甚至在 relay log 中也可能有 gaps
+			在这种情况下，一个 gap 后继的事务将等待所有值钱的事务完成
+			这个事务被标记为 gap successor
+		*/
+		static_assert(SEQ_UNINIT == 0, "");
+		if (unlikely(sequence_number > last_sequence_number + 1))
+		{
+			/*
+				TODO: account autopositioning
+				assert(rli->replicate_same_server_id);
+			*/
+			DBUG_PRINT("info", ("sequence_number gap found, "
+								"last_sequence_number %lld, sequence_number %lld",
+								last_sequence_number, sequence_number));
+			gap_successor = true;
+		}
+  	}
 
-  DBUG_PRINT("info", ("sequence_number %lld, last_committed %lld",
-                      sequence_number, last_committed));
+	
+	// new group 标志实际上与 force 标志相同，当 up 时表示需要与 workers 进行 sync
+  	is_new_group = (
+		//   submode 切换后的第一个 event
+		first_event
+		// 需要一个新的 group 来开启
+		// todo: 把 `force_new_group` 变成 sequence_number == SEQ_UNINIT
+		|| force_new_group
+		// 没有 commit point timestamp 的 Rewritten event（todo：找 use case）
+		|| sequence_number == SEQ_UNINIT
+		/*
+			undefined parent (e.g the very first trans from the master),
+			or old master.
+		*/
+		// undefined parent（例如来自 master 的第一个事务），或来自 old master。
+        || last_committed == SEQ_UNINIT
+		/*
+			When gap successor depends on a gap before it the scheduler has
+			to serialize this transaction execution with previously
+			scheduled ones. Below for simplicity it's assumed that such
+			gap-dependency is always the case.
+		*/
+		// 当 gap successor 依赖于它之前的 gap 时，
+		// 调度器必须将这个事务的执行与之前已调度的事务作序列化。
+		// 为了简单起见，我们假设这种 gap-dependency 总是如此
+        || gap_successor
+		/*
+			previous group did not have sequence number assigned.
+			It's execution must be finished until the current group
+			can be assigned.
+			Dependency of the current group on the previous
+			can't be tracked. So let's wait till the former is over.
+		*/
+		// previous group 没有分配 sequence number。
+		// 其执行必须结束，直到可以分配到 current group
+		// 由于无法 track current group 对前一个 group 的依赖关系，所以我们要等到前者结束。
+        || last_sequence_number == SEQ_UNINIT);
 
-  if (first_event) {
-    first_event = false;
-  } else {
-    if (unlikely(clock_leq(sequence_number, last_committed) &&
-                 last_committed != SEQ_UNINIT)) {
-      /* inconsistent (buggy) timestamps */
-      LogErr(ERROR_LEVEL, ER_RPL_INCONSISTENT_TIMESTAMPS_IN_TRX,
-             sequence_number, last_committed);
-      return ER_MTS_CANT_PARALLEL;
-    }
-    if (unlikely(clock_leq(sequence_number, last_sequence_number) &&
-                 sequence_number != SEQ_UNINIT)) {
-      /* inconsistent (buggy) timestamps */
-      LogErr(ERROR_LEVEL, ER_RPL_INCONSISTENT_SEQUENCE_NO_IN_TRX,
-             sequence_number, last_sequence_number);
-      return ER_MTS_CANT_PARALLEL;
-    }
-    /*
-      Being scheduled transaction sequence may have gaps, even in
-      relay log. In such case a transaction that succeeds a gap will
-      wait for all ealier that were scheduled to finish. It's marked
-      as gap successor now.
-    */
-    static_assert(SEQ_UNINIT == 0, "");
-    if (unlikely(sequence_number > last_sequence_number + 1)) {
-      /*
-        TODO: account autopositioning
-        assert(rli->replicate_same_server_id);
-      */
-      DBUG_PRINT("info", ("sequence_number gap found, "
-                          "last_sequence_number %lld, sequence_number %lld",
-                          last_sequence_number, sequence_number));
-      gap_successor = true;
-    }
-  }
+	/*
+		The coordinator waits till all transactions on which the current one
+		depends on are applied.
+	*/
+	// coordinator 要等待直到当前事务所依赖的所有之前的事务都被 apply
+  	if (!is_new_group)
+	{
+    	longlong lwm_estimate = estimate_lwm_timestamp();
 
-  /*
-    The new group flag is practically the same as the force flag
-    when up to indicate syncronization with Workers.
-  */
-  is_new_group =
-      (/* First event after a submode switch; */
-       first_event ||
-       /* Require a fresh group to be started; */
-       // todo: turn `force_new_group' into sequence_number == SEQ_UNINIT
-       // condition
-       force_new_group ||
-       /* Rewritten event without commit point timestamp (todo: find use case)
-        */
-       sequence_number == SEQ_UNINIT ||
-       /*
-         undefined parent (e.g the very first trans from the master),
-         or old master.
-       */
-       last_committed == SEQ_UNINIT ||
-       /*
-         When gap successor depends on a gap before it the scheduler has
-         to serialize this transaction execution with previously
-         scheduled ones. Below for simplicity it's assumed that such
-         gap-dependency is always the case.
-       */
-       gap_successor ||
-       /*
-         previous group did not have sequence number assigned.
-         It's execution must be finished until the current group
-         can be assigned.
-         Dependency of the current group on the previous
-         can't be tracked. So let's wait till the former is over.
-       */
-       last_sequence_number == SEQ_UNINIT);
-  /*
-    The coordinator waits till all transactions on which the current one
-    depends on are applied.
-  */
-  if (!is_new_group) {
-    longlong lwm_estimate = estimate_lwm_timestamp();
+    	if (!clock_leq(last_committed, lwm_estimate)	// last_committed > lwm_estimate
+        	&& rli->gaq->assigned_group_index != rli->gaq->entry) // 当前事务前面还有执行中的事务
+		{
+			/*
+				"Unlikely" branch.
 
-    if (!clock_leq(last_committed, lwm_estimate) &&
-        rli->gaq->assigned_group_index != rli->gaq->entry) {
-      /*
-        "Unlikely" branch.
+				The following block improves possibly stale lwm and when the
+				waiting condition stays, recompute min_waited_timestamp and go
+				waiting.
+				At awakening set min_waited_timestamp to commit_parent in the
+				subsequent GAQ index (could be NIL).
+			*/
+			// 下面的代码块改进了可能过时的 lwm，当等待条件保持不变时，重新计算 min_waited_timestamp 并等待。
+      		if (wait_for_last_committed_trx(rli, last_committed))
+			{
+				/*
+				MTS was waiting for a dependent transaction to finish but either it
+				has failed or the applier was requested to stop. In any case, this
+				transaction wasn't started yet and should not warn about the
+				coordinator stopping in a middle of a transaction to avoid polluting
+				the server error log.
+				*/
+				rli->reported_unsafe_warning = true;
+				return -1;
+			}
+			/*
+				Making the slave's max last committed (lwm) to satisfy this
+				transaction's scheduling condition.
+			*/
+			if (gap_successor) last_lwm_timestamp = sequence_number - 1; // WTF???真的走得进来？
+			assert(!clock_leq(sequence_number, estimate_lwm_timestamp()));
+    	}
 
-        The following block improves possibly stale lwm and when the
-        waiting condition stays, recompute min_waited_timestamp and go
-        waiting.
-        At awakening set min_waited_timestamp to commit_parent in the
-        subsequent GAQ index (could be NIL).
-      */
-      if (wait_for_last_committed_trx(rli, last_committed)) {
-        /*
-          MTS was waiting for a dependent transaction to finish but either it
-          has failed or the applier was requested to stop. In any case, this
-          transaction wasn't started yet and should not warn about the
-          coordinator stopping in a middle of a transaction to avoid polluting
-          the server error log.
-        */
-        rli->reported_unsafe_warning = true;
-        return -1;
-      }
-      /*
-        Making the slave's max last committed (lwm) to satisfy this
-        transaction's scheduling condition.
-      */
-      if (gap_successor) last_lwm_timestamp = sequence_number - 1;
-      assert(!clock_leq(sequence_number, estimate_lwm_timestamp()));
-    }
+	    delegated_jobs++;
 
-    delegated_jobs++;
+    	assert(!force_new_group);
+  	}
+	else
+	{
+		assert(delegated_jobs >= jobs_done);
+		assert(is_error || (rli->gaq->len + jobs_done == 1 + delegated_jobs));
+		assert(rli->mts_group_status == Relay_log_info::MTS_IN_GROUP);
 
-    assert(!force_new_group);
-  } else {
-    assert(delegated_jobs >= jobs_done);
-    assert(is_error || (rli->gaq->len + jobs_done == 1 + delegated_jobs));
-    assert(rli->mts_group_status == Relay_log_info::MTS_IN_GROUP);
+		/*
+		Under the new group fall the following use cases:
+		- events from an OLD (sequence_number unaware) master;
+		- malformed (missed BEGIN or GTID_NEXT) group incl. its
+			particular form of CREATE..SELECT..from..@user_var (or rand- and
+			int- var in place of @user- var).
+			The malformed group is handled exceptionally each event is executed
+			as a solitary group yet by the same (zero id) worker.
+		*/
+    	if (-1 == wait_for_workers_to_finish(rli)) return ER_MTS_INCONSISTENT_DATA;
 
-    /*
-      Under the new group fall the following use cases:
-      - events from an OLD (sequence_number unaware) master;
-      - malformed (missed BEGIN or GTID_NEXT) group incl. its
-        particular form of CREATE..SELECT..from..@user_var (or rand- and
-        int- var in place of @user- var).
-        The malformed group is handled exceptionally each event is executed
-        as a solitary group yet by the same (zero id) worker.
-    */
-    if (-1 == wait_for_workers_to_finish(rli)) return ER_MTS_INCONSISTENT_DATA;
-
-    rli->mts_group_status = Relay_log_info::MTS_IN_GROUP;  // wait set it to NOT
-    assert(min_waited_timestamp == SEQ_UNINIT);
-    /*
-      the instant last lwm timestamp must reset when force flag is up.
-    */
-    rli->gaq->lwm.sequence_number = last_lwm_timestamp = SEQ_UNINIT;
-    delegated_jobs = 1;
-    jobs_done = 0;
-    force_new_group = false;
-    /*
-      Not sequenced event can be followed with a logically relating
-      e.g User var to be followed by CREATE table.
-      It's supported to be executed in one-by-one fashion.
-      Todo: remove with the event group parser worklog.
-    */
-    if (sequence_number == SEQ_UNINIT && last_committed == SEQ_UNINIT)
-      rli->last_assigned_worker = *rli->workers.begin();
-  }
+	    rli->mts_group_status = Relay_log_info::MTS_IN_GROUP;  // wait set it to NOT
+    	assert(min_waited_timestamp == SEQ_UNINIT);
+		/*
+		the instant last lwm timestamp must reset when force flag is up.
+		*/
+		rli->gaq->lwm.sequence_number = last_lwm_timestamp = SEQ_UNINIT;
+		delegated_jobs = 1;
+		jobs_done = 0;
+		force_new_group = false;
+		/*
+		Not sequenced event can be followed with a logically relating
+		e.g User var to be followed by CREATE table.
+		It's supported to be executed in one-by-one fashion.
+		Todo: remove with the event group parser worklog.
+		*/
+		if (sequence_number == SEQ_UNINIT && last_committed == SEQ_UNINIT)
+		rli->last_assigned_worker = *rli->workers.begin();
+	}
 
 #ifndef NDEBUG
-  mysql_mutex_lock(&rli->mts_gaq_LOCK);
-  assert(is_error || (rli->gaq->len + jobs_done == delegated_jobs));
-  mysql_mutex_unlock(&rli->mts_gaq_LOCK);
+	mysql_mutex_lock(&rli->mts_gaq_LOCK);
+	assert(is_error || (rli->gaq->len + jobs_done == delegated_jobs));
+	mysql_mutex_unlock(&rli->mts_gaq_LOCK);
 #endif
-  return 0;
+  	return 0;
 }
 
 /**
@@ -1007,50 +1050,57 @@ Slave_worker *Mts_submode_logical_clock::get_free_worker(Relay_log_info *rli) {
 }
 
 /**
-  Waits for slave workers to finish off the pending tasks before returning.
-  Used in this submode to make sure that all assigned jobs have been done.
-
-  @param rli  coordinator rli.
-  @param ignore worker to ignore.
-  @return -1 for error.
+ * 等待 slave workers 完成 pending tasks
+ * 在 submode 中使用，以保证所有 assigned jobs 都已完成
+ *
+ * @param rli    coordinator rli.
+ * @param ignore worker to ignore.
+ * @return -1 for error.
            0 no error.
  */
-int Mts_submode_logical_clock::wait_for_workers_to_finish(
-    Relay_log_info *rli, MY_ATTRIBUTE((unused)) Slave_worker *ignore) {
-  PSI_stage_info *old_stage = nullptr;
-  THD *thd = rli->info_thd;
-  DBUG_TRACE;
-  DBUG_PRINT("info", ("delegated %d, jobs_done %d", delegated_jobs, jobs_done));
-  // Update thd info as waiting for workers to finish.
-  thd->enter_stage(&stage_replica_waiting_for_workers_to_process_queue,
-                   old_stage, __func__, __FILE__, __LINE__);
-  while (delegated_jobs > jobs_done && !thd->killed && !is_error) {
-    // Todo: consider to replace with a. GAQ::get_lwm_timestamp() or
-    // b. (better) pthread wait+signal similarly to DB type.
-    if (mta_checkpoint_routine(rli, true)) return -1;
-  }
+int
+Mts_submode_logical_clock::wait_for_workers_to_finish(
+    	Relay_log_info *rli,
+		MY_ATTRIBUTE((unused)) Slave_worker *ignore)
+{
+	PSI_stage_info *old_stage = nullptr;
+	THD *thd = rli->info_thd;
+	DBUG_TRACE;
+	DBUG_PRINT("info", ("delegated %d, jobs_done %d", delegated_jobs, jobs_done));
+	// Update thd info as waiting for workers to finish.
+	thd->enter_stage(&stage_replica_waiting_for_workers_to_process_queue,
+					old_stage, __func__, __FILE__, __LINE__);
+	while (delegated_jobs > jobs_done && !thd->killed && !is_error)
+	{
+		// Todo: consider to replace with a. GAQ::get_lwm_timestamp() or
+		// b. (better) pthread wait+signal similarly to DB type.
+		if (mta_checkpoint_routine(rli, true)) return -1;
+	}
 
-  // Check if there is a failure on a not-ignored Worker
-  for (Slave_worker **it = rli->workers.begin(); it != rli->workers.end();
-       ++it) {
-    Slave_worker *w_i = *it;
-    if (w_i->running_status != Slave_worker::RUNNING) return -1;
-  }
+	// Check if there is a failure on a not-ignored Worker
+	for (Slave_worker **it = rli->workers.begin();
+		 it != rli->workers.end();
+		 ++it)
+	{
+		Slave_worker *w_i = *it;
+		if (w_i->running_status != Slave_worker::RUNNING) return -1;
+	}
 
-  DBUG_EXECUTE_IF("wait_for_workers_to_finish_after_wait", {
-    const char act[] = "now WAIT_FOR coordinator_continue";
-    assert(!debug_sync_set_action(rli->info_thd, STRING_WITH_LEN(act)));
-  });
+	DBUG_EXECUTE_IF("wait_for_workers_to_finish_after_wait",
+	{
+		const char act[] = "now WAIT_FOR coordinator_continue";
+		assert(!debug_sync_set_action(rli->info_thd, STRING_WITH_LEN(act)));
+	});
 
-  // The current commit point sequence may end here (e.g Rotate to new log)
-  rli->gaq->lwm.sequence_number = SEQ_UNINIT;
-  // Restore previous info.
-  THD_STAGE_INFO(thd, *old_stage);
-  DBUG_PRINT("info", ("delegated %d, jobs_done %d, Workers have finished their"
-                      " jobs",
-                      delegated_jobs, jobs_done));
-  rli->mts_group_status = Relay_log_info::MTS_NOT_IN_GROUP;
-  return !thd->killed && !is_error ? 0 : -1;
+	// The current commit point sequence may end here (e.g Rotate to new log)
+	rli->gaq->lwm.sequence_number = SEQ_UNINIT;
+	// Restore previous info.
+	THD_STAGE_INFO(thd, *old_stage);
+	DBUG_PRINT("info", ("delegated %d, jobs_done %d, Workers have finished their"
+						" jobs",
+						delegated_jobs, jobs_done));
+	rli->mts_group_status = Relay_log_info::MTS_NOT_IN_GROUP;
+	return !thd->killed && !is_error ? 0 : -1;
 }
 
 /**

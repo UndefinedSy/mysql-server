@@ -2565,50 +2565,50 @@ bool Log_event::contains_partition_info(bool end_group_sets_max_dbs) {
 
   return res;
 }
-/*
-  SYNOPSIS
-    This function assigns a parent ID to the job group being scheduled in
-  parallel. It also checks if we can schedule the new event in parallel with the
-  previous ones being executed.
-
-  @param        ev log event that has to be scheduled next.
-  @param       rli Pointer to coordinator's relay log info.
-  @return      true if error
-               false otherwise
+/**
+ * 这个函数用于：
+ * - 为正准备进行并行调度的 job group（即一个事务中的多个 group）分配了一个 parent ID。
+ * - 检查我们是否可以将这个待执行的事件与之前正在执行的事件并行调度。
+ * @param        ev 下一个被调度的 log event
+ * @param       rli Pointer to coordinator's relay log info.
+ * @return      true if error
+                false otherwise
  */
-static bool schedule_next_event(Log_event *ev, Relay_log_info *rli) {
-  int error;
-  // Check if we can schedule this event
-  error = rli->current_mts_submode->schedule_next_event(rli, ev);
-  switch (error) {
-    char llbuff[22];
-    case ER_MTS_CANT_PARALLEL:
-      llstr(rli->get_event_relay_log_pos(), llbuff);
-      my_error(ER_MTS_CANT_PARALLEL, MYF(0), ev->get_type_str(),
-               rli->get_event_relay_log_name(), llbuff,
-               "The master event is logically timestamped incorrectly.");
-      return true;
-    case ER_MTS_INCONSISTENT_DATA:
-      llstr(rli->get_event_relay_log_pos(), llbuff);
-      {
-        char errfmt[] =
-            "Coordinator experienced an error or was killed while scheduling "
-            "an event at relay-log name %s position %s.";
-        char errbuf[sizeof(errfmt) + FN_REFLEN + sizeof(llbuff)];
-        sprintf(errbuf, errfmt, rli->get_event_relay_log_name(), llbuff);
-        my_error(ER_MTS_INCONSISTENT_DATA, MYF(0), errbuf);
-        return true;
-      }
-      /* Don't have to do anything. */
-      return true;
-    case -1:
-      /* Unable to schedule: wait_for_last_committed_trx has failed */
-      return true;
-    default:
-      return false;
-  }
-  /* Keep compiler happy */
-  return false;
+static bool schedule_next_event(Log_event *ev, Relay_log_info *rli)
+{
+	int error;
+	// Check if we can schedule this event
+	error = rli->current_mts_submode->schedule_next_event(rli, ev);
+	switch (error)
+	{
+    	char llbuff[22];
+    	case ER_MTS_CANT_PARALLEL:
+			llstr(rli->get_event_relay_log_pos(), llbuff);
+			my_error(ER_MTS_CANT_PARALLEL, MYF(0), ev->get_type_str(),
+					rli->get_event_relay_log_name(), llbuff,
+					"The master event is logically timestamped incorrectly.");
+			return true;
+    	case ER_MTS_INCONSISTENT_DATA:
+			llstr(rli->get_event_relay_log_pos(), llbuff);
+			{
+				char errfmt[] =
+					"Coordinator experienced an error or was killed while scheduling "
+					"an event at relay-log name %s position %s.";
+				char errbuf[sizeof(errfmt) + FN_REFLEN + sizeof(llbuff)];
+				sprintf(errbuf, errfmt, rli->get_event_relay_log_name(), llbuff);
+				my_error(ER_MTS_INCONSISTENT_DATA, MYF(0), errbuf);
+				return true;
+			}
+			/* Don't have to do anything. */
+			return true;
+    	case -1:
+			/* Unable to schedule: wait_for_last_committed_trx has failed */
+			return true;
+    	default:
+      		return false;
+  	}
+	/* Keep compiler happy */
+	return false;
 }
 
 /**

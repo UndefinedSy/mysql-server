@@ -1112,187 +1112,228 @@ Slave_worker *get_least_occupied_worker(Relay_log_info *rli,
 
 /**
  * 当一个 group 执行完或者异常终止时会调用
-   Deallocation routine to cancel out few effects of
-   @c map_db_to_worker().
-   Involved into processing of the group APH tuples are updated.
-   @c last_group_done_index member is set to the GAQ index of
-   the current group.
-   CGEP the Worker partition cache is cleaned up.
-
-   @param ev     a pointer to Log_event
-   @param error  error code after processing the event by caller.
+ * Deallocation routine 以消除一些影响
+ * @c map_db_to_worker().
+ * 参与处理的 group APH tuples 会被更新。
+ * @c last_group_done_indexmember member 会设置为当前 group 的 GAQ index。
+ * CGEP(curr_group_exec_parts) the Worker partition cache is cleaned up.
+ * 
+ * @param ev     a pointer to Log_event
+ * @param error  error code after processing the event by caller.
 */
-void Slave_worker::slave_worker_ends_group(Log_event *ev, int error) {
-  DBUG_TRACE;
-  Slave_job_group *ptr_g = nullptr;
+void
+Slave_worker::slave_worker_ends_group(Log_event *ev, int error)
+{
+	DBUG_TRACE;
+	Slave_job_group *ptr_g = nullptr;
 
-  if (!error) {
-    ptr_g = c_rli->gaq->get_job_group(gaq_index);
+	// 若 event 的处理过程没有出错
+	if (!error)
+	{
+    	ptr_g = c_rli->gaq->get_job_group(gaq_index);
 
-    assert(gaq_index == ev->mts_group_idx);
-    /*
-      It guarantees that the worker is removed from order commit queue when
-      its transaction doesn't binlog anything. It will break innodb group
-      commit, but it should rarely happen.
-    */
-    Commit_order_manager::wait_and_finish(info_thd, false);
+    	assert(gaq_index == ev->mts_group_idx);
+		/*
+		It guarantees that the worker is removed from order commit queue when
+		its transaction doesn't binlog anything. It will break innodb group
+		commit, but it should rarely happen.
+		*/
+		// 这保证当 worker 的事务没有 binlog 任何东西时，
+		// 该 worker 会从 order commit queue 中被移除。
+		// 这会破坏 innodb group commit，但应该很少发生。
+		Commit_order_manager::wait_and_finish(info_thd, false);
 
-    // first ever group must have relay log name
-    assert(last_group_done_index != c_rli->gaq->size ||
-           ptr_g->group_relay_log_name != nullptr);
-    assert(ptr_g->worker_id == id);
+		// first ever group must have relay log name
+		assert(last_group_done_index != c_rli->gaq->size
+			   || ptr_g->group_relay_log_name != nullptr);
+		assert(ptr_g->worker_id == id);
 
-    /*
-      DDL that has not yet updated the slave info repository does it now.
-    */
-    if (ev->get_type_code() != binary_log::XID_EVENT &&
-        ev->get_type_code() != binary_log::TRANSACTION_PAYLOAD_EVENT &&
-        !is_committed_ddl(ev)) {
-      commit_positions(ev, ptr_g, true);
-      DBUG_EXECUTE_IF(
-          "crash_after_commit_and_update_pos",
-          sql_print_information("Crashing crash_after_commit_and_update_pos.");
-          flush_info(true); DBUG_SUICIDE(););
-    }
+		/*
+		DDL that has not yet updated the slave info repository does it now.
+		*/
+		// 尚未更新从库 info repository 的 DDL 现在会去更新
+		if (ev->get_type_code() != binary_log::XID_EVENT
+			&& ev->get_type_code() != binary_log::TRANSACTION_PAYLOAD_EVENT
+			&& !is_committed_ddl(ev))
+		{
+			commit_positions(ev, ptr_g, true);
+			DBUG_EXECUTE_IF(
+				"crash_after_commit_and_update_pos",
+				sql_print_information("Crashing crash_after_commit_and_update_pos.");
+				flush_info(true); DBUG_SUICIDE(););
+		}
 
-    ptr_g->group_master_log_pos = group_master_log_pos;
-    ptr_g->group_relay_log_pos = group_relay_log_pos;
-    ptr_g->done.store(1);
-    last_group_done_index = gaq_index;
-    last_groups_assigned_index = ptr_g->total_seqno;
-    reset_gaq_index();
-    groups_done++;
+		ptr_g->group_master_log_pos = group_master_log_pos;
+		ptr_g->group_relay_log_pos = group_relay_log_pos;
+		ptr_g->done.store(1);
+		last_group_done_index = gaq_index;
+		last_groups_assigned_index = ptr_g->total_seqno;
+		reset_gaq_index();
+		groups_done++;
 
-  } else {
-    if (running_status != STOP_ACCEPTED) {
-      // tagging as exiting so Coordinator won't be able synchronize with it
-      mysql_mutex_lock(&jobs_lock);
-      running_status = ERROR_LEAVING;
-      mysql_mutex_unlock(&jobs_lock);
+  	}
+	// 若 event 的处理过程出现了错误
+	else
+	{
+    	if (running_status != STOP_ACCEPTED)
+		{
+			// tagging as exiting so Coordinator won't be able synchronize with it
+			mysql_mutex_lock(&jobs_lock);
+			running_status = ERROR_LEAVING;
+			mysql_mutex_unlock(&jobs_lock);
 
-      // Fatal error happens, it notifies the following transaction to rollback
-      Commit_order_manager::wait_and_finish(info_thd, true);
+			// Fatal error happens, it notifies the following transaction to rollback
+			// 发生了 fatal error，通知 following transaction 回滚
+			Commit_order_manager::wait_and_finish(info_thd, true);
 
-      // Killing Coordinator to indicate eventual consistency error
-      mysql_mutex_lock(&c_rli->info_thd->LOCK_thd_data);
-      c_rli->info_thd->awake(THD::KILL_QUERY);
-      mysql_mutex_unlock(&c_rli->info_thd->LOCK_thd_data);
-    }
-  }
+			// Killing Coordinator to indicate eventual consistency error
+			// kill coordinator 以表明最终一致性错误
+			mysql_mutex_lock(&c_rli->info_thd->LOCK_thd_data);
+			c_rli->info_thd->awake(THD::KILL_QUERY);
+			mysql_mutex_unlock(&c_rli->info_thd->LOCK_thd_data);
+		}
+	}
 
-  /*
-    Cleanup relating to the last executed group regardless of error.
-  */
-  if (current_mts_submode->get_type() == MTS_PARALLEL_TYPE_DB_NAME) {
+	/**
+	 * 清理与最后执行的 group 有关的内容，不管是否有错误。
+	 * Cleanup relating to the last executed group regardless of error.
+	 */
+	// 若当前的 multi thread slave 模式为 db type
+	if (current_mts_submode->get_type() == MTS_PARALLEL_TYPE_DB_NAME)
+	{
 #ifndef NDEBUG
-    {
-      std::stringstream ss;
-      for (size_t i = 0; i < curr_group_exec_parts.size(); i++) {
-        if (curr_group_exec_parts[i]->db_len) {
-          ss << curr_group_exec_parts[i]->db << ", ";
-        }
-      }
-      DBUG_PRINT("debug", ("UNASSIGN %p %s", current_thd, ss.str().c_str()));
-    }
+		{
+		std::stringstream ss;
+		for (size_t i = 0; i < curr_group_exec_parts.size(); i++) {
+			if (curr_group_exec_parts[i]->db_len) {
+			ss << curr_group_exec_parts[i]->db << ", ";
+			}
+		}
+		DBUG_PRINT("debug", ("UNASSIGN %p %s", current_thd, ss.str().c_str()));
+		}
 #endif
-    for (size_t i = 0; i < curr_group_exec_parts.size(); i++) {
-      db_worker_hash_entry *entry = curr_group_exec_parts[i];
+		for (size_t i = 0; i < curr_group_exec_parts.size(); i++)
+		{
+			db_worker_hash_entry *entry = curr_group_exec_parts[i];
 
-      mysql_mutex_lock(&c_rli->slave_worker_hash_lock);
+			mysql_mutex_lock(&c_rli->slave_worker_hash_lock);
 
-      assert(entry);
+			assert(entry);
 
-      entry->usage--;
+			entry->usage--;
 
-      assert(entry->usage >= 0);
+			assert(entry->usage >= 0);
 
-      if (entry->usage == 0) {
-        usage_partition--;
-        /*
-          The detached entry's temp table list, possibly updated, remains
-          with the entry at least until time Coordinator will deallocate it
-          from the hash, that is either due to stop or extra size of the hash.
-        */
-        assert(usage_partition >= 0);
-        assert(this->info_thd->temporary_tables == nullptr);
-        assert(!entry->temporary_tables || !entry->temporary_tables->prev);
+      		if (entry->usage == 0)
+			{
+				usage_partition--;
+				/*
+				The detached entry's temp table list, possibly updated, remains
+				with the entry at least until time Coordinator will deallocate it
+				from the hash, that is either due to stop or extra size of the hash.
+				*/
+				assert(usage_partition >= 0);
+				assert(this->info_thd->temporary_tables == nullptr);
+				assert(!entry->temporary_tables || !entry->temporary_tables->prev);
 
-        if (entry->worker != this)  // Coordinator is waiting
-        {
-          DBUG_PRINT("info", ("Notifying entry %p release by worker %lu", entry,
-                              this->id));
+				if (entry->worker != this)  // Coordinator is waiting
+				{
+				DBUG_PRINT("info", ("Notifying entry %p release by worker %lu", entry,
+									this->id));
 
-          mysql_cond_signal(&c_rli->slave_worker_hash_cond);
-        }
-      } else
-        assert(usage_partition != 0);
+				mysql_cond_signal(&c_rli->slave_worker_hash_cond);
+				}
+      		}
+			else
+		        assert(usage_partition != 0);
 
-      mysql_mutex_unlock(&c_rli->slave_worker_hash_lock);
-    }
+      		mysql_mutex_unlock(&c_rli->slave_worker_hash_lock);
+    	}
 
-    curr_group_exec_parts.clear();
-    curr_group_exec_parts.shrink_to_fit();
+		curr_group_exec_parts.clear();
+		curr_group_exec_parts.shrink_to_fit();
 
-    if (error) {
-      // Awakening Coordinator that could be waiting for entry release
-      mysql_mutex_lock(&c_rli->slave_worker_hash_lock);
-      mysql_cond_signal(&c_rli->slave_worker_hash_cond);
-      mysql_mutex_unlock(&c_rli->slave_worker_hash_lock);
-    }
-  } else  // not DB-type scheduler
-  {
-    assert(current_mts_submode->get_type() == MTS_PARALLEL_TYPE_LOGICAL_CLOCK);
-    /*
-      Check if there're any waiter. If there're try incrementing lwm and
-      signal to those who've got sasfied with the waiting condition.
+		if (error)
+		{
+			// Awakening Coordinator that could be waiting for entry release
+			mysql_mutex_lock(&c_rli->slave_worker_hash_lock);
+			mysql_cond_signal(&c_rli->slave_worker_hash_cond);
+			mysql_mutex_unlock(&c_rli->slave_worker_hash_lock);
+		}
+  	}
+	// 若当前的 multi thread slave 模式不是 db-type scheduler
+	else
+  	{
+		assert(current_mts_submode->get_type() == MTS_PARALLEL_TYPE_LOGICAL_CLOCK);
+		/*
+		Check if there're any waiter. If there're try incrementing lwm and
+		signal to those who've got sasfied with the waiting condition.
 
-      In a "good" "likely" execution branch the waiter set is expected
-      to be empty. LWM is advanced by Coordinator asynchronously.
-      Also lwm is advanced by a dependent Worker when it inserts its waiting
-      request into the waiting list.
-    */
-    Mts_submode_logical_clock *mts_submode =
-        static_cast<Mts_submode_logical_clock *>(c_rli->current_mts_submode);
-    int64 min_child_waited_logical_ts =
-        mts_submode->min_waited_timestamp.load();
+		In a "good" "likely" execution branch the waiter set is expected
+		to be empty. LWM is advanced by Coordinator asynchronously.
+		Also lwm is advanced by a dependent Worker when it inserts its waiting
+		request into the waiting list.
+		*/
+		/**
+		 * 检查是否有 waiter。
+		 * 如果有的话，尝试递增 lwm，并向那些已经满足了 waiting condition 的发出信号。
+		 * 
+		 * 在一个 "good" "likely" 执行分支中，waiter set 期望为空。LWM 是由 Coordinator 异步递增的
+		 * 另外，当一个依赖他人的 Worker 将其 waiting request 插入到等待列表时，
+		 * lwm 也会被这个 dependent Worker 推进。
+		 */
+		Mts_submode_logical_clock *mts_submode =
+			static_cast<Mts_submode_logical_clock *>(c_rli->current_mts_submode);
+		// 拿到当前 coordinator 的 min_waited_timestamp
+		int64 min_child_waited_logical_ts =
+			mts_submode->min_waited_timestamp.load();
 
-    DBUG_EXECUTE_IF("replica_worker_ends_group_before_signal_lwm", {
-      const char act[] = "now WAIT_FOR worker_continue";
-      assert(!debug_sync_set_action(current_thd, STRING_WITH_LEN(act)));
-    });
+		DBUG_EXECUTE_IF("replica_worker_ends_group_before_signal_lwm", {
+			const char act[] = "now WAIT_FOR worker_continue";
+			assert(!debug_sync_set_action(current_thd, STRING_WITH_LEN(act)));
+    	});
 
-    if (unlikely(error)) {
-      mysql_mutex_lock(&c_rli->mts_gaq_LOCK);
-      mts_submode->is_error = true;
-      if (mts_submode->min_waited_timestamp != SEQ_UNINIT)
-        mysql_cond_signal(&c_rli->logical_clock_cond);
-      mysql_mutex_unlock(&c_rli->mts_gaq_LOCK);
-    } else if (min_child_waited_logical_ts != SEQ_UNINIT) {
-      mysql_mutex_lock(&c_rli->mts_gaq_LOCK);
+    	if (unlikely(error))
+		{
+			mysql_mutex_lock(&c_rli->mts_gaq_LOCK);
+			mts_submode->is_error = true;
+      		if (mts_submode->min_waited_timestamp != SEQ_UNINIT)
+        		mysql_cond_signal(&c_rli->logical_clock_cond);
+      		mysql_mutex_unlock(&c_rli->mts_gaq_LOCK);
+		}
+		// 当 coordinator 的 min_waited_timestamp 不为 0
+		else if (min_child_waited_logical_ts != SEQ_UNINIT)
+		{
+      		mysql_mutex_lock(&c_rli->mts_gaq_LOCK);
 
-      /*
-        min_child_waited_logical_ts may include an old value, so we need to
-        check it again after getting the lock.
-      */
-      if (mts_submode->min_waited_timestamp != SEQ_UNINIT) {
-        longlong curr_lwm = mts_submode->get_lwm_timestamp(c_rli, true);
+			/*
+				min_child_waited_logical_ts may include an old value, so we need to
+				check it again after getting the lock.
+			*/
+			// min_child_waited_logical_ts 可能包含一个旧值，所以我们需要在拿锁后再次检查它
+			// 这里再次检查最新的 min_waited_timestamp 是否为 0
+      		if (mts_submode->min_waited_timestamp != SEQ_UNINIT)
+			{
+				// 尝试更新并返回 last_lwm_timestamp
+        		longlong curr_lwm = mts_submode->get_lwm_timestamp(c_rli, true);
 
-        if (mts_submode->clock_leq(mts_submode->min_waited_timestamp,
-                                   curr_lwm)) {
-          /*
-            There's a transaction that depends on the current.
-          */
-          mysql_cond_signal(&c_rli->logical_clock_cond);
-        }
-      }
-      mysql_mutex_unlock(&c_rli->mts_gaq_LOCK);
-    }
+				// 若 min_waited_timestamp <= lwm 则唤醒那些 waiter
+        		if (mts_submode->clock_leq(mts_submode->min_waited_timestamp, curr_lwm))
+				{
+					/*
+						There's a transaction that depends on the current.
+					*/
+          			mysql_cond_signal(&c_rli->logical_clock_cond);
+        		}
+      		}
+      		mysql_mutex_unlock(&c_rli->mts_gaq_LOCK);
+    	}
 
 #ifndef NDEBUG
-    curr_group_seen_sequence_number = false;
+    	curr_group_seen_sequence_number = false;
 #endif
-  }
-  curr_group_seen_gtid = false;
+  	}
+  	curr_group_seen_gtid = false;
 }
 
 /**

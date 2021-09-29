@@ -2612,59 +2612,51 @@ static bool schedule_next_event(Log_event *ev, Relay_log_info *rli)
 }
 
 /**
-   The method maps the event to a Worker and return a pointer to it.
-   Sending the event to the Worker is done by the caller.
-
-   Irrespective of the type of Group marking (DB partioned or BGC) the
-   following holds true:
-
-   - recognize the beginning of a group to allocate the group descriptor
-     and queue it;
-   - associate an event with a Worker (which also handles possible conflicts
-     detection and waiting for their termination);
-   - finalize the group assignement when the group closing event is met.
-
-   When parallelization mode is BGC-based the partitioning info in the event
-   is simply ignored. Thereby association with a Worker does not require
-   Assigned Partition Hash of the partitioned method.
-   This method is not interested in all the taxonomy of the event group
-   property, what we care about is the boundaries of the group.
-
-   As a part of the group, an event belongs to one of the following types:
-
-   B - beginning of a group of events (BEGIN query_log_event)
-   g - mini-group representative event containing the partition info
-      (any Table_map, a Query_log_event)
-   p - a mini-group internal event that *p*receeding its g-parent
-      (int_, rand_, user_ var:s)
-   r - a mini-group internal "regular" event that follows its g-parent
-      (Delete, Update, Write -rows)
-   T - terminator of the group (XID, COMMIT, ROLLBACK, auto-commit query)
-
-   Only the first g-event computes the assigned Worker which once
-   is determined remains to be for the rest of the group.
-   That is the g-event solely carries partitioning info.
-   For B-event the assigned Worker is NULL to indicate Coordinator
-   has not yet decided. The same applies to p-event.
-
-   Notice, these is a special group consisting of optionally multiple p-events
-   terminating with a g-event.
-   Such case is caused by old master binlog and a few corner-cases of
-   the current master version (todo: to fix).
-
-   In case of the event accesses more than OVER_MAX_DBS the method
-   has to ensure sure previously assigned groups to all other workers are
-   done.
-
-
-   @note The function updates GAQ queue directly, updates APH hash
-         plus relocates some temporary tables from Coordinator's list into
-         involved entries of APH through @c map_db_to_worker.
-         There's few memory allocations commented where to be freed.
-
-   @return a pointer to the Worker struct or NULL.
-*/
-
+ * 这个方法将 event 映射到一个 worker，并返回该 worker 的指针
+ * 将 event 发送给 worker 是由调用者完成
+ * 
+ * 无论 Group markind 的类型是什么（DB partitioned / BGC）
+ * 以下内容均适用:
+ * - 识别一个 group 的开始，以分配 group descriptor 并将其入队
+ * - 将一个 event 与一个 Worker 相关联（它还处理可能的冲突检测并等待冲突终止）
+ * - 当满足 group closing event 时，完成 group assignement
+ * 
+ * 当并行模式是基于 BGC 的时候，event 中的 partitioning info 被简单地忽略了
+ * 因此，与 Worker 的 association 不需要 partitioned method 的 Assigned Partition Hash。
+ * 
+ * 这个方法并不关心 event group property 的分类，只关心的是 group 的边界。
+ * 
+ * 作为一个 group 的一部分，一个 event 属于以下类型之一：
+ * 
+ * 		B - 一组事件的开始（BEGIN query_log_event）
+ * 		g - 包含 partition info 的 mini-group representative event
+ * 			(any Table_map, a Query_log_event)
+ * 		p - 在 g-parent 之前的一个 mini-group 的内部 event
+ * 			(int_, rand_, user_ var:s)
+ * 		r - 一个 mini-group 的内部 "regular" event，紧跟着 g-parent。
+ * 			(Delete, Update, Write -rows)
+ * 		T - group 的终止符（XID、COMMIT、ROLLBACK、auto-commit query）。
+ * 
+ * 只有第一个 g-event 会计算 assigned Worker，
+ * Worker 一旦被确定，就会对该 group 的其他成员保持不变。
+ * 也就是说，g-event 只携带 partitioning info。
+ * 
+ * 对于 B-event，assigned Worker 是 NULL，表示 Coordinator 还没有决定。
+ * 这也同样适用于 p-event。
+ * 
+ * 注意，有一些 special group，由可选的多个 p-events 组成，以一个 g-event 结束。
+ * 这种情况是由旧的 master binlog 和当前 master version 的一些 corner-cases 造成的
+ * 
+ * 在 event 访问超过 OVER_MAX_DBS 的情况下，
+ * 该方法必须确保之前分配给所有其他 workers 的 groups 被完成。
+ * 
+ * @note 该函数直接更新 GAQ queue，更新 APH(Assigned Partition Hash?) hash，
+ * 		 并通过 @c map_db_to_worker 将 Coordinator 列表中的一些临时表
+ * 		 relocates 为 APH 的相关条目。
+ * 		 有几处内存分配被注释为需要在那里释放
+ * 
+ * @return 一个指向 Worker 的指针，或者是 NULL
+ */
 Slave_worker *Log_event::get_slave_worker(Relay_log_info *rli) {
   Slave_job_group group = Slave_job_group(), *ptr_group = nullptr;
   bool is_s_event;

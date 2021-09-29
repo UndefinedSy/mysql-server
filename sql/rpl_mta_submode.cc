@@ -521,6 +521,7 @@ Mts_submode_logical_clock::get_lwm_timestamp(Relay_log_info *rli,
   	if (last_lwm_index != rli->gaq->size)
 	{
 		// non-decreasing lwm invariant
+		// ？？？不会回退吗
 		assert(clock_leq(last_lwm_timestamp, ptr_g->sequence_number));
 
 		last_lwm_timestamp = ptr_g->sequence_number;
@@ -812,10 +813,13 @@ int Mts_submode_logical_clock::schedule_next_event(Relay_log_info *rli,
 		assert(is_error || (rli->gaq->len + jobs_done == 1 + delegated_jobs));
 		assert(rli->mts_group_status == Relay_log_info::MTS_IN_GROUP);
 
-		/*
-		Under the new group fall the following use cases:
-		- events from an OLD (sequence_number unaware) master;
-		- malformed (missed BEGIN or GTID_NEXT) group incl. its
+		/**
+		 * 在 new group 的场景下有以下的几种情况:
+		 * 	- event 来自于一个 OLD（sequence_number unaware）的 master
+		 * 	- 格式错误（缺少 BEGIN 或 GTID_NEXT）group。
+		 * 	  其特殊形式的 CREATE..SELECT..from..@user_var
+		 * 	 （或 rand- 和 int- var 代替@user- var）。
+		 * malformed (missed BEGIN or GTID_NEXT) group incl. its
 			particular form of CREATE..SELECT..from..@user_var (or rand- and
 			int- var in place of @user- var).
 			The malformed group is handled exceptionally each event is executed

@@ -374,38 +374,46 @@ bool Commit_order_manager::wait(THD *thd) {
   return false;
 }
 
-void Commit_order_manager::wait_and_finish(THD *thd, bool error) {
-  DBUG_TRACE;
-  assert(thd);
+void
+Commit_order_manager::wait_and_finish(THD *thd, bool error)
+{
+	DBUG_TRACE;
+	assert(thd);
 
-  if (has_commit_order_manager(thd)) {
-    /*
-      We only care about read/write transactions and those that
-      have been registered in the commit order manager.
-     */
-    Slave_worker *worker = dynamic_cast<Slave_worker *>(thd->rli_slave);
-    Commit_order_manager *mngr = worker->get_commit_order_manager();
+	if (has_commit_order_manager(thd))
+	{
+		/*
+		We only care about read/write transactions and those that
+		have been registered in the commit order manager.
+		*/
+		// 我们只关心 read/write 事务，以及那些在 commit order manager 中注册了的事务
+		Slave_worker *worker = dynamic_cast<Slave_worker *>(thd->rli_slave);
+		Commit_order_manager *mngr = worker->get_commit_order_manager();
 
-    if (error || worker->found_commit_order_deadlock()) {
-      // Error or deadlock: if not retryable, release next worker
-      bool ret;
-      std::tie(ret, std::ignore, std::ignore) =
-          worker->check_and_report_end_of_retries(thd);
-      if (ret) {
-        /*
-          worker can set m_rollback_trx when it is its turn to commit,
-          so need to call wait() before updating m_rollback_trx.
-        */
-        mngr->wait(worker);
-        mngr->set_rollback_status();
-        mngr->finish(worker);
-      }
-    } else {
-      // No error or deadlock: release next worker.
-      mngr->wait(worker);
-      mngr->finish(worker);
-    }
-  }
+		if (error || worker->found_commit_order_deadlock())
+		{
+			// Error or deadlock: if not retryable, release next worker
+			bool ret;
+			std::tie(ret, std::ignore, std::ignore) =
+				worker->check_and_report_end_of_retries(thd);
+      		if (ret)
+			{
+				/*
+				worker can set m_rollback_trx when it is its turn to commit,
+				so need to call wait() before updating m_rollback_trx.
+				*/
+				mngr->wait(worker);
+				mngr->set_rollback_status();
+				mngr->finish(worker);
+			}
+    	}
+		else
+		{
+			// No error or deadlock: release next worker.
+			mngr->wait(worker);
+			mngr->finish(worker);
+    	}
+  	}
 }
 
 bool Commit_order_manager::get_rollback_status() {

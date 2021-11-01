@@ -1781,17 +1781,16 @@ int *get_remaining_argc() { return &remaining_argc; }
 char ***get_remaining_argv() { return &remaining_argv; }
 
 /*
-  Multiple threads of execution use the random state maintained in global
-  sql_rand to generate random numbers. sql_rnd_with_mutex use mutex
-  LOCK_sql_rand to protect sql_rand across multiple instantiations that use
-  sql_rand to generate random numbers.
+ *  用于多线程执行，使用全局变量 `sql_rand` 中维护的 random state 来生成随机数。
+ *  sql_rnd_with_mutex 使用互斥锁 LOCK_sql_rand 保护 sql_rand。
  */
-ulong sql_rnd_with_mutex() {
-  mysql_mutex_lock(&LOCK_sql_rand);
-  ulong tmp =
-      (ulong)(my_rnd(&sql_rand) * 0xffffffff); /* make all bits random */
-  mysql_mutex_unlock(&LOCK_sql_rand);
-  return tmp;
+ulong sql_rnd_with_mutex()
+{
+	mysql_mutex_lock(&LOCK_sql_rand);
+	ulong tmp =
+		(ulong)(my_rnd(&sql_rand) * 0xffffffff); /* make all bits random */
+	mysql_mutex_unlock(&LOCK_sql_rand);
+	return tmp;
 }
 
 struct System_status_var *get_thd_status_var(THD *thd, bool *aggregated) {
@@ -5208,48 +5207,49 @@ static void end_ssl() {
   @return Retur 0 or 1 if an error occurred.
  */
 static int generate_server_uuid() {
-  THD *thd;
-  Item_func_uuid *func_uuid;
-  String uuid;
+	THD* thd;
+	Item_func_uuid* func_uuid;
+	String uuid;
 
-  /*
-    To be able to run this from boot, we allocate a temporary THD,
-    since plugins are not yet loaded we pass false to temporary THD.
-   */
-  if (!(thd = new THD(false))) {
-    LogErr(ERROR_LEVEL, ER_NO_THD_NO_UUID);
-    return 1;
-  }
-  thd->thread_stack = (char *)&thd;
-  thd->store_globals();
+	/*
+	 *	为了能够在 boot 时运行该方法，我们分配了一个临时的 THD，
+	 *	因为此时各种插件尚未加载，我们将 false 传递给临时的 THD。
+	 */
+	if (!(thd = new THD(false))) {
+		LogErr(ERROR_LEVEL, ER_NO_THD_NO_UUID);
+		return 1;
+	}
+	thd->thread_stack = (char *)&thd;
+	thd->store_globals();
 
-  /*
-    Initialize the variables which are used during "uuid generator
-    initialization" with values that should normally differ between
-    mysqlds on the same host. This avoids that another mysqld started
-    at the same time on the same host get the same "server_uuid".
-  */
+	/*
+	 *	初始化 uuid generator init 所使用的变量
+	 *  该值通常对于同一台机器上的不同 mysqld 不同
+	 *	这避免了在同一主机上同时启动的另一个 mysqld 生成一个相同的 server_uuid
+	 */
 
-  const time_t save_server_start_time = server_start_time;
-  server_start_time += ((ulonglong)current_pid << 48) + current_pid;
-  thd->status_var.bytes_sent = (ulonglong)thd;
+	// 存了 init 时的物理时间
+	const time_t save_server_start_time = server_start_time;
+	server_start_time += ((ulonglong)current_pid << 48) + current_pid;
+	thd->status_var.bytes_sent = (ulonglong)thd;
 
-  lex_start(thd);
-  func_uuid = new (thd->mem_root) Item_func_uuid();
-  func_uuid->fixed = true;
-  func_uuid->val_str(&uuid);
+	lex_start(thd);
+	func_uuid = new (thd->mem_root) Item_func_uuid();
+	func_uuid->fixed = true;
+	func_uuid->val_str(&uuid);	// item_strfunc.cc:mysql_generate_uuid(String *str)
+	
 
-  // Restore global variables used for salting
-  server_start_time = save_server_start_time;
+	// Restore global variables used for salting
+	server_start_time = save_server_start_time;
 
-  delete thd;
+	delete thd;
 
-  strncpy(server_uuid, uuid.c_ptr(), UUID_LENGTH);
-  DBUG_EXECUTE_IF("server_uuid_deterministic",
-                  memcpy(server_uuid, "00000000-1111-0000-1111-000000000000",
-                         UUID_LENGTH););
-  server_uuid[UUID_LENGTH] = '\0';
-  return 0;
+	strncpy(server_uuid, uuid.c_ptr(), UUID_LENGTH);
+	DBUG_EXECUTE_IF("server_uuid_deterministic",
+					memcpy(server_uuid, "00000000-1111-0000-1111-000000000000",
+							UUID_LENGTH););
+	server_uuid[UUID_LENGTH] = '\0';
+	return 0;
 }
 
 /**

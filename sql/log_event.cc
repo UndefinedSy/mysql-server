@@ -2657,104 +2657,118 @@ static bool schedule_next_event(Log_event *ev, Relay_log_info *rli)
  * 
  * @return 一个指向 Worker 的指针，或者是 NULL
  */
-Slave_worker *Log_event::get_slave_worker(Relay_log_info *rli) {
-  Slave_job_group group = Slave_job_group(), *ptr_group = nullptr;
-  bool is_s_event;
-  Slave_worker *ret_worker = nullptr;
-  char llbuff[22];
-  Slave_committed_queue *gaq = rli->gaq;
-  DBUG_TRACE;
+Slave_worker *Log_event::get_slave_worker(Relay_log_info *rli)
+{
+	Slave_job_group group = Slave_job_group(), *ptr_group = nullptr;
+	bool is_s_event;
+	Slave_worker *ret_worker = nullptr;
+	char llbuff[22];
+	Slave_committed_queue *gaq = rli->gaq;
+	DBUG_TRACE;
 
-  /* checking partioning properties and perform corresponding actions */
+	/* checking partioning properties and perform corresponding actions */
 
-  // Beginning of a group designated explicitly with BEGIN or GTID
-  if ((is_s_event = starts_group()) || is_gtid_event(this) ||
-      // or DDL:s or autocommit queries possibly associated with own p-events
-      (!rli->curr_group_seen_begin && !rli->curr_group_seen_gtid &&
-       /*
-         the following is a special case of B-free still multi-event group like
-         { p_1,p_2,...,p_k, g }.
-         In that case either GAQ is empty (the very first group is being
-         assigned) or the last assigned group index points at one of
-         mapped-to-a-worker.
-       */
-       (gaq->empty() ||
-        gaq->get_job_group(rli->gaq->assigned_group_index)->worker_id !=
-            MTS_WORKER_UNDEF))) {
-    if (!rli->curr_group_seen_gtid && !rli->curr_group_seen_begin) {
-      rli->mts_groups_assigned++;
+	// Beginning of a group designated explicitly with BEGIN or GTID
+  	if ((is_s_event = starts_group())
+	  	|| is_gtid_event(this)
+      	// or DDL:s or autocommit queries possibly associated with own p-events
+      	|| (!rli->curr_group_seen_begin && !rli->curr_group_seen_gtid
+			/*
+				the following is a special case of B-free still multi-event group like
+				{ p_1,p_2,...,p_k, g }.
+				In that case either GAQ is empty (the very first group is being
+				assigned) or the last assigned group index points at one of
+				mapped-to-a-worker.
+			*/
+       		&& (gaq->empty()
+			   	|| gaq->get_job_group(rli->gaq->assigned_group_index)->worker_id != MTS_WORKER_UNDEF)))
+	{
+		if (!rli->curr_group_seen_gtid
+			&& !rli->curr_group_seen_begin)
+		{
+			rli->mts_groups_assigned++;
 
-      rli->curr_group_isolated = false;
-      group.reset(common_header->log_pos, rli->mts_groups_assigned);
-      // the last occupied GAQ's array index
-      gaq->assigned_group_index = gaq->en_queue(&group);
-      DBUG_PRINT("info", ("gaq_idx= %ld  gaq->size=%ld",
-                          gaq->assigned_group_index, gaq->size));
-      assert(gaq->assigned_group_index != MTS_WORKER_UNDEF);
-      assert(gaq->assigned_group_index < gaq->size);
-      assert(gaq->get_job_group(rli->gaq->assigned_group_index)
-                 ->group_relay_log_name == nullptr);
-      assert(rli->last_assigned_worker == nullptr ||
-             !is_mts_db_partitioned(rli));
+			rli->curr_group_isolated = false;
+			group.reset(common_header->log_pos, rli->mts_groups_assigned);
+			// the last occupied GAQ's array index
+			gaq->assigned_group_index = gaq->en_queue(&group);
+			DBUG_PRINT("info", ("gaq_idx= %ld  gaq->size=%ld",
+								gaq->assigned_group_index, gaq->size));
+			assert(gaq->assigned_group_index != MTS_WORKER_UNDEF);
+			assert(gaq->assigned_group_index < gaq->size);
+			assert(gaq->get_job_group(rli->gaq->assigned_group_index)
+						->group_relay_log_name == nullptr);
+			assert(rli->last_assigned_worker == nullptr ||
+					!is_mts_db_partitioned(rli));
 
-      if (is_s_event || is_gtid_event(this)) {
-        Slave_job_item job_item = {this, rli->get_event_relay_log_number(),
-                                   rli->get_event_start_pos()};
-        // B-event is appended to the Deferred Array associated with GCAP
-        rli->curr_group_da.push_back(job_item);
+			if (is_s_event || is_gtid_event(this))
+			{
+				Slave_job_item job_item = {this, rli->get_event_relay_log_number(),
+										   rli->get_event_start_pos()};
+				// B-event is appended to the Deferred Array associated with GCAP
+				rli->curr_group_da.push_back(job_item);
 
-        assert(rli->curr_group_da.size() == 1);
+				assert(rli->curr_group_da.size() == 1);
 
-        if (starts_group()) {
-          // mark the current group as started with explicit B-event
-          rli->mts_end_group_sets_max_dbs = true;
-          rli->curr_group_seen_begin = true;
-        }
+				if (starts_group())
+				{
+					// mark the current group as started with explicit B-event
+					rli->mts_end_group_sets_max_dbs = true;
+					rli->curr_group_seen_begin = true;
+				}
 
-        if (is_gtid_event(this)) {
-          // mark the current group as started with explicit Gtid-event
-          rli->curr_group_seen_gtid = true;
+				if (is_gtid_event(this))
+				{
+					// mark the current group as started with explicit Gtid-event
+					rli->curr_group_seen_gtid = true;
 
-          Gtid_log_event *gtid_log_ev = static_cast<Gtid_log_event *>(this);
-          rli->started_processing(gtid_log_ev);
-        }
+					Gtid_log_event *gtid_log_ev = static_cast<Gtid_log_event *>(this);
+					rli->started_processing(gtid_log_ev);
+				}
 
-        if (schedule_next_event(this, rli)) {
-          rli->abort_slave = true;
-          if (is_gtid_event(this)) {
-            rli->clear_processing_trx();
-          }
-          return nullptr;
-        }
-        return ret_worker;
-      }
-    } else {
-      /*
-       The block is a result of not making GTID event as group starter.
-       TODO: Make GITD event as B-event that is starts_group() to
-       return true.
-      */
-      Slave_job_item job_item = {this, rli->get_event_relay_log_number(),
-                                 rli->get_event_relay_log_pos()};
+				if (schedule_next_event(this, rli))
+				{
+					rli->abort_slave = true;
+					if (is_gtid_event(this))
+					{
+						rli->clear_processing_trx();
+					}
+					return nullptr;
+				}
+				return ret_worker;
+			}
+		}
+		else
+		{
+			/*
+			The block is a result of not making GTID event as group starter.
+			TODO: Make GITD event as B-event that is starts_group() to
+			return true.
+			*/
+			Slave_job_item job_item = {this, rli->get_event_relay_log_number(),
+										rli->get_event_relay_log_pos()};
 
-      // B-event is appended to the Deferred Array associated with GCAP
-      rli->curr_group_da.push_back(job_item);
-      rli->curr_group_seen_begin = true;
-      rli->mts_end_group_sets_max_dbs = true;
-      if (!rli->curr_group_seen_gtid && schedule_next_event(this, rli)) {
-        rli->abort_slave = true;
-        return nullptr;
-      }
+			// B-event is appended to the Deferred Array associated with GCAP
+			rli->curr_group_da.push_back(job_item);
+			rli->curr_group_seen_begin = true;
+			rli->mts_end_group_sets_max_dbs = true;
+			if (!rli->curr_group_seen_gtid && schedule_next_event(this, rli))
+			{
+				rli->abort_slave = true;
+				return nullptr;
+			}
 
-      assert(rli->curr_group_da.size() == 2);
-      assert(starts_group());
-      return ret_worker;
-    }
-    if (schedule_next_event(this, rli)) {
-      rli->abort_slave = true;
-      return nullptr;
-    }
-  }
+			assert(rli->curr_group_da.size() == 2);
+			assert(starts_group());
+			return ret_worker;
+		}
+
+		if (schedule_next_event(this, rli))
+		{
+			rli->abort_slave = true;
+			return nullptr;
+		}
+	}
 
   ptr_group = gaq->get_job_group(rli->gaq->assigned_group_index);
   if (!is_mts_db_partitioned(rli)) {
@@ -3104,228 +3118,264 @@ int Log_event::apply_gtid_event(Relay_log_info *rli) {
 
    @return 0 as success, otherwise a failure.
 */
-int Log_event::apply_event(Relay_log_info *rli) {
-  DBUG_TRACE;
-  DBUG_PRINT("info", ("event_type=%s", get_type_str()));
-  bool parallel = false;
-  enum enum_mts_event_exec_mode actual_exec_mode = EVENT_EXEC_PARALLEL;
-  THD *rli_thd = rli->info_thd;
+int Log_event::apply_event(Relay_log_info *rli)
+{
+    DBUG_TRACE;
+    DBUG_PRINT("info", ("event_type=%s", get_type_str()));
+    bool parallel = false;
+    enum enum_mts_event_exec_mode actual_exec_mode = EVENT_EXEC_PARALLEL;
+    THD *rli_thd = rli->info_thd;
 
-  worker = rli;
+    worker = rli;
 
-  if (rli->is_mts_recovery()) {
-    bool skip = bitmap_is_set(&rli->recovery_groups, rli->mts_recovery_index) &&
-                (get_mts_execution_mode(rli->mts_group_status ==
-                                        Relay_log_info::MTS_IN_GROUP) ==
-                 EVENT_EXEC_PARALLEL);
-    if (skip) {
-      return 0;
-    } else {
-      int error = do_apply_event(rli);
-      if (rli->is_processing_trx()) {
-        // needed to identify DDL's; uses the same logic as in
-        // get_slave_worker()
-        if (starts_group() && get_type_code() == binary_log::QUERY_EVENT) {
-          rli->curr_group_seen_begin = true;
+    if (rli->is_mts_recovery())
+    {
+        bool skip = bitmap_is_set(&rli->recovery_groups, rli->mts_recovery_index)
+                    && (get_mts_execution_mode(
+                            rli->mts_group_status == Relay_log_info::MTS_IN_GROUP)
+                        == EVENT_EXEC_PARALLEL);
+        if (skip)
+        {
+            return 0;
         }
-        if (error == 0 &&
-            (ends_group() || (get_type_code() == binary_log::QUERY_EVENT &&
-                              !rli->curr_group_seen_begin))) {
-          rli->finished_processing();
-          rli->curr_group_seen_begin = false;
+        else
+        {
+            int error = do_apply_event(rli);
+            if (rli->is_processing_trx())
+            {
+                // needed to identify DDL's; uses the same logic as in
+                // get_slave_worker()
+                if (starts_group() && get_type_code() == binary_log::QUERY_EVENT)
+                {
+                    rli->curr_group_seen_begin = true;
+                }
+
+                if (error == 0
+                    && (ends_group()
+                        || (get_type_code() == binary_log::QUERY_EVENT
+                            && !rli->curr_group_seen_begin)))
+                {
+                    rli->finished_processing();
+                    rli->curr_group_seen_begin = false;
+                }
+            }
+            return error;
         }
-      }
-      return error;
     }
-  }
 
-  if (!(parallel = rli->is_parallel_exec()) ||
-      ((actual_exec_mode = get_mts_execution_mode(
-            rli->mts_group_status == Relay_log_info::MTS_IN_GROUP)) !=
-       EVENT_EXEC_PARALLEL)) {
-    if (parallel) {
-      /*
-         There are two classes of events that Coordinator executes
-         itself. One e.g the master Rotate requires all Workers to finish up
-         their assignments. The other async class, e.g the slave Rotate,
-         can't have this such synchronization because Worker might be waiting
-         for terminal events to finish.
-      */
+    if (!(parallel = rli->is_parallel_exec())
+        || ((actual_exec_mode = get_mts_execution_mode(
+                rli->mts_group_status == Relay_log_info::MTS_IN_GROUP))
+            != EVENT_EXEC_PARALLEL))
+    {
+        if (parallel)
+        {
+            /*
+            There are two classes of events that Coordinator executes
+            itself. One e.g the master Rotate requires all Workers to finish up
+            their assignments. The other async class, e.g the slave Rotate,
+            can't have this such synchronization because Worker might be waiting
+            for terminal events to finish.
+            */
 
-      if (actual_exec_mode != EVENT_EXEC_ASYNC) {
-        /*
-          this  event does not split the current group but is indeed
-          a separator beetwen two master's binlog therefore requiring
-          Workers to sync.
-        */
-        if (rli->curr_group_da.size() > 0 && is_mts_db_partitioned(rli) &&
-            get_type_code() != binary_log::INCIDENT_EVENT) {
-          char llbuff[22];
-          /*
-             Possible reason is a old version binlog sequential event
-             wrappped with BEGIN/COMMIT or preceeded by User|Int|Random- var.
-             MTS has to stop to suggest restart in the permanent sequential
-             mode.
-          */
-          llstr(rli->get_event_relay_log_pos(), llbuff);
-          my_error(ER_MTS_CANT_PARALLEL, MYF(0), get_type_str(),
-                   rli->get_event_relay_log_name(), llbuff,
-                   "possible malformed group of events from an old master");
+            if (actual_exec_mode != EVENT_EXEC_ASYNC)
+            {
+                /*
+                this  event does not split the current group but is indeed
+                a separator beetwen two master's binlog therefore requiring
+                Workers to sync.
+                */
+                if (rli->curr_group_da.size() > 0
+                    && is_mts_db_partitioned(rli)
+                    && get_type_code() != binary_log::INCIDENT_EVENT)
+                {
+                    char llbuff[22];
+                    /*
+                    Possible reason is a old version binlog sequential event
+                    wrappped with BEGIN/COMMIT or preceeded by User|Int|Random- var.
+                    MTS has to stop to suggest restart in the permanent sequential
+                    mode.
+                    */
+                    llstr(rli->get_event_relay_log_pos(), llbuff);
+                    my_error(ER_MTS_CANT_PARALLEL, MYF(0), get_type_str(),
+                             rli->get_event_relay_log_name(), llbuff,
+                             "possible malformed group of events from an old master");
 
-          /* Coordinator cant continue, it marks MTS group status accordingly */
-          rli->mts_group_status = Relay_log_info::MTS_KILLED_GROUP;
+                    /* Coordinator cant continue, it marks MTS group status accordingly */
+                    rli->mts_group_status = Relay_log_info::MTS_KILLED_GROUP;
 
-          goto err;
-        }
+                    goto err;
+                }
 
-        if (get_type_code() == binary_log::INCIDENT_EVENT &&
-            rli->curr_group_da.size() > 0 &&
-            rli->current_mts_submode->get_type() ==
-                MTS_PARALLEL_TYPE_LOGICAL_CLOCK) {
+                if (get_type_code() == binary_log::INCIDENT_EVENT
+                    && rli->curr_group_da.size() > 0
+                    && rli->current_mts_submode->get_type() ==
+                            MTS_PARALLEL_TYPE_LOGICAL_CLOCK)
+                {
 #ifndef NDEBUG
-          assert(rli->curr_group_da.size() == 1);
-          Log_event *ev = rli->curr_group_da[0].data;
-          assert(ev->get_type_code() == binary_log::GTID_LOG_EVENT ||
-                 ev->get_type_code() == binary_log::ANONYMOUS_GTID_LOG_EVENT);
+                    assert(rli->curr_group_da.size() == 1);
+                    Log_event *ev = rli->curr_group_da[0].data;
+                    assert(ev->get_type_code() == binary_log::GTID_LOG_EVENT
+                           || ev->get_type_code() == binary_log::ANONYMOUS_GTID_LOG_EVENT);
 #endif
-          /*
-            With MTS logical clock mode, when coordinator is applying an
-            incident event, it must withdraw delegated_job increased by
-            the incident's GTID before waiting for workers to finish.
-            So that it can exit from mta_checkpoint_routine.
-          */
-          ((Mts_submode_logical_clock *)rli->current_mts_submode)
-              ->withdraw_delegated_job();
-        }
-        /*
-          Marking sure the event will be executed in sequential mode.
-        */
-        if (rli->current_mts_submode->wait_for_workers_to_finish(rli) == -1) {
-          // handle synchronization error
-          rli->report(WARNING_LEVEL, 0,
-                      "Slave worker thread has failed to apply an event. As a "
-                      "consequence, the coordinator thread is stopping "
-                      "execution.");
-          return -1;
-        }
-        /*
-          Given not in-group mark the event handler can invoke checkpoint
-          update routine in the following course.
-        */
-        assert(rli->mts_group_status == Relay_log_info::MTS_NOT_IN_GROUP ||
-               !is_mts_db_partitioned(rli));
+                    /*
+                    With MTS logical clock mode, when coordinator is applying an
+                    incident event, it must withdraw delegated_job increased by
+                    the incident's GTID before waiting for workers to finish.
+                    So that it can exit from mta_checkpoint_routine.
+                    */
+                    ((Mts_submode_logical_clock *)rli->current_mts_submode)
+                        ->withdraw_delegated_job();
+                }
+                /*
+                Marking sure the event will be executed in sequential mode.
+                */
+                if (rli->current_mts_submode->wait_for_workers_to_finish(rli) == -1)
+                {
+                    // handle synchronization error
+                    rli->report(WARNING_LEVEL, 0,
+                                "Slave worker thread has failed to apply an event. As a "
+                                "consequence, the coordinator thread is stopping "
+                                "execution.");
+                    return -1;
+                }
+                /*
+                Given not in-group mark the event handler can invoke checkpoint
+                update routine in the following course.
+                */
+                assert(rli->mts_group_status == Relay_log_info::MTS_NOT_IN_GROUP
+                       || !is_mts_db_partitioned(rli));
 
-        if (get_type_code() == binary_log::INCIDENT_EVENT &&
-            rli->curr_group_da.size() > 0) {
-          assert(rli->curr_group_da.size() == 1);
-          /*
-            When MTS is enabled, the incident event must be applied by the
-            coordinator. So the coordinator applies its GTID right before
-            applying the incident event..
-          */
-          int error = apply_gtid_event(rli);
-          if (error) return -1;
-        }
+                if (get_type_code() == binary_log::INCIDENT_EVENT
+                    && rli->curr_group_da.size() > 0)
+                {
+                    assert(rli->curr_group_da.size() == 1);
+                    /*
+                    When MTS is enabled, the incident event must be applied by the
+                    coordinator. So the coordinator applies its GTID right before
+                    applying the incident event..
+                    */
+                    int error = apply_gtid_event(rli);
+                    if (error) return -1;
+                }
 
 #ifndef NDEBUG
-        /* all Workers are idle as done through wait_for_workers_to_finish */
-        for (uint k = 0; k < rli->curr_group_da.size(); k++) {
-          assert(!(rli->workers[k]->usage_partition));
-          assert(!(rli->workers[k]->jobs.len));
-        }
+                /* all Workers are idle as done through wait_for_workers_to_finish */
+                for (uint k = 0; k < rli->curr_group_da.size(); k++)
+                {
+                    assert(!(rli->workers[k]->usage_partition));
+                    assert(!(rli->workers[k]->jobs.len));
+                }
 #endif
-      } else {
-        assert(actual_exec_mode == EVENT_EXEC_ASYNC);
-      }
+            }
+            else
+            {
+                assert(actual_exec_mode == EVENT_EXEC_ASYNC);
+            }
+        }
+
+        int error = do_apply_event(rli);
+        if (rli->is_processing_trx())
+        {
+            // needed to identify DDL's; uses the same logic as in get_slave_worker()
+            if (starts_group()
+                && get_type_code() == binary_log::QUERY_EVENT)
+            {
+                rli->curr_group_seen_begin = true;
+            }
+
+            if (error == 0
+                && (ends_group()
+                    || (get_type_code() == binary_log::QUERY_EVENT
+                        && !rli->curr_group_seen_begin)))
+            {
+                DBUG_EXECUTE_IF("rpl_ps_tables",
+				{
+                    const char act[] =
+                        "now SIGNAL signal.rpl_ps_tables_apply_before "
+                        "WAIT_FOR signal.rpl_ps_tables_apply_finish";
+                    assert(opt_debug_sync_timeout > 0);
+                    assert(!debug_sync_set_action(current_thd, STRING_WITH_LEN(act)));
+                };);
+
+                rli->finished_processing();
+                rli->curr_group_seen_begin = false;
+
+                DBUG_EXECUTE_IF("rpl_ps_tables",
+				{
+                    const char act[] =
+                        "now SIGNAL signal.rpl_ps_tables_apply_after_finish "
+                        "WAIT_FOR signal.rpl_ps_tables_apply_continue";
+                    assert(opt_debug_sync_timeout > 0);
+                    assert(!debug_sync_set_action(current_thd, STRING_WITH_LEN(act)));
+                };);
+            }
+        }
+        return error;
     }
 
-    int error = do_apply_event(rli);
-    if (rli->is_processing_trx()) {
-      // needed to identify DDL's; uses the same logic as in get_slave_worker()
-      if (starts_group() && get_type_code() == binary_log::QUERY_EVENT) {
-        rli->curr_group_seen_begin = true;
-      }
-      if (error == 0 &&
-          (ends_group() || (get_type_code() == binary_log::QUERY_EVENT &&
-                            !rli->curr_group_seen_begin))) {
-        DBUG_EXECUTE_IF("rpl_ps_tables", {
-          const char act[] =
-              "now SIGNAL signal.rpl_ps_tables_apply_before "
-              "WAIT_FOR signal.rpl_ps_tables_apply_finish";
-          assert(opt_debug_sync_timeout > 0);
-          assert(!debug_sync_set_action(current_thd, STRING_WITH_LEN(act)));
-        };);
-        rli->finished_processing();
-        rli->curr_group_seen_begin = false;
-        DBUG_EXECUTE_IF("rpl_ps_tables", {
-          const char act[] =
-              "now SIGNAL signal.rpl_ps_tables_apply_after_finish "
-              "WAIT_FOR signal.rpl_ps_tables_apply_continue";
-          assert(opt_debug_sync_timeout > 0);
-          assert(!debug_sync_set_action(current_thd, STRING_WITH_LEN(act)));
-        };);
-      }
-    }
-    return error;
-  }
+    assert(actual_exec_mode == EVENT_EXEC_PARALLEL);
+    assert(!(rli->curr_group_seen_begin && ends_group())
+            /*
+            This is an empty group being processed due to gtids.
+            */
+           || (rli->curr_group_seen_begin
+               && rli->curr_group_seen_gtid
+               && ends_group())
+           || is_mts_db_partitioned(rli)
+           || rli->last_assigned_worker
+            /*
+            Begin_load_query can be logged w/o db info and within
+            Begin/Commit. That's a pattern forcing sequential
+            applying of LOAD-DATA.
+            */
+           || (rli->curr_group_da.back().data->get_type_code() ==
+                binary_log::BEGIN_LOAD_QUERY_EVENT)
+            /*
+            Delete_file can also be logged w/o db info and within
+            Begin/Commit. That's a pattern forcing sequential
+            applying of LOAD-DATA.
+            */
+           ||(rli->curr_group_da.back().data->get_type_code() ==
+                binary_log::DELETE_FILE_EVENT));
 
-  assert(actual_exec_mode == EVENT_EXEC_PARALLEL);
-  assert(!(rli->curr_group_seen_begin && ends_group()) ||
-         /*
-           This is an empty group being processed due to gtids.
-         */
-         (rli->curr_group_seen_begin && rli->curr_group_seen_gtid &&
-          ends_group()) ||
-         is_mts_db_partitioned(rli) || rli->last_assigned_worker ||
-         /*
-           Begin_load_query can be logged w/o db info and within
-           Begin/Commit. That's a pattern forcing sequential
-           applying of LOAD-DATA.
-         */
-         (rli->curr_group_da.back().data->get_type_code() ==
-          binary_log::BEGIN_LOAD_QUERY_EVENT) ||
-         /*
-           Delete_file can also be logged w/o db info and within
-           Begin/Commit. That's a pattern forcing sequential
-           applying of LOAD-DATA.
-         */
-         (rli->curr_group_da.back().data->get_type_code() ==
-          binary_log::DELETE_FILE_EVENT));
+    worker = nullptr;
+    rli->mts_group_status = Relay_log_info::MTS_IN_GROUP;
 
-  worker = nullptr;
-  rli->mts_group_status = Relay_log_info::MTS_IN_GROUP;
-
-  worker =
-      (Relay_log_info *)(rli->last_assigned_worker = get_slave_worker(rli));
+    worker =
+        (Relay_log_info *)(rli->last_assigned_worker = get_slave_worker(rli));
 
 #ifndef NDEBUG
-  if (rli->last_assigned_worker)
-    DBUG_PRINT("mts",
-               ("Assigning job to worker %lu", rli->last_assigned_worker->id));
+    if (rli->last_assigned_worker)
+        DBUG_PRINT("mts",
+                ("Assigning job to worker %lu", rli->last_assigned_worker->id));
 #endif
 
 err:
-  if (rli_thd->is_error() || (!worker && rli->abort_slave)) {
-    assert(!worker);
+    if (rli_thd->is_error() || (!worker && rli->abort_slave))
+    {
+        assert(!worker);
 
-    /*
-      Destroy all deferred buffered events but the current prior to exit.
-      The current one will be deleted as an event never destined/assigned
-      to any Worker in Coordinator's regular execution path.
-    */
-    for (uint k = 0; k < rli->curr_group_da.size(); k++) {
-      Log_event *ev_buf = rli->curr_group_da[k].data;
-      if (this != ev_buf) delete ev_buf;
+        /*
+        Destroy all deferred buffered events but the current prior to exit.
+        The current one will be deleted as an event never destined/assigned
+        to any Worker in Coordinator's regular execution path.
+        */
+        for (uint k = 0; k < rli->curr_group_da.size(); k++) {
+        Log_event *ev_buf = rli->curr_group_da[k].data;
+        if (this != ev_buf) delete ev_buf;
+        }
+        rli->curr_group_da.clear();
+    } 
+    else
+    {
+        assert(worker || rli->curr_group_assigned_parts.size() == 0);
     }
-    rli->curr_group_da.clear();
-  } else {
-    assert(worker || rli->curr_group_assigned_parts.size() == 0);
-  }
 
-  return (!(rli_thd->is_error() || (!worker && rli->abort_slave)) ||
-          DBUG_EVALUATE_IF("fault_injection_get_replica_worker", 1, 0))
-             ? 0
-             : -1;
+    return (!(rli_thd->is_error() || (!worker && rli->abort_slave))
+            || DBUG_EVALUATE_IF("fault_injection_get_replica_worker", 1, 0))
+           ? 0
+           : -1;
 }
 
 /**************************************************************************
@@ -4478,644 +4528,676 @@ static bool is_silent_error(THD *thd) {
   mismatch. This mismatch could be implemented with a new ER_ code, and
   to ignore it you would use --replica-skip-errors...
 */
-int Query_log_event::do_apply_event(Relay_log_info const *rli,
-                                    const char *query_arg, size_t q_len_arg) {
-  DBUG_TRACE;
-  int expected_error, actual_error = 0;
+int
+Query_log_event::do_apply_event(Relay_log_info const *rli,
+                                const char *query_arg,
+                                size_t q_len_arg)
+{
+    DBUG_TRACE;
+    int expected_error, actual_error = 0;
 
-  DBUG_PRINT("info", ("query=%s, q_len_arg=%lu", query,
-                      static_cast<unsigned long>(q_len_arg)));
+    DBUG_PRINT("info", ("query=%s, q_len_arg=%lu", query,
+                        static_cast<unsigned long>(q_len_arg)));
 
-  /*
-    Colleagues: please never free(thd->catalog) in MySQL. This would
-    lead to bugs as here thd->catalog is a part of an alloced block,
-    not an entire alloced block (see
-    Query_log_event::do_apply_event()). Same for thd->db().str.  Thank
-    you.
-  */
-
-  if (catalog_len) {
-    LEX_CSTRING catalog_lex_cstr = {catalog, catalog_len};
-    thd->set_catalog(catalog_lex_cstr);
-  } else
-    thd->set_catalog(EMPTY_CSTR);
-
-  bool need_inc_rewrite_db_filter_counter;
-  size_t valid_len;
-  bool len_error;
-  bool is_invalid_db_name =
-      validate_string(system_charset_info, db, db_len, &valid_len, &len_error);
-
-  DBUG_PRINT("debug", ("is_invalid_db_name= %s, valid_len=%zu, len_error=%s",
-                       is_invalid_db_name ? "true" : "false", valid_len,
-                       len_error ? "true" : "false"));
-
-  if (is_invalid_db_name || len_error) {
-    rli->report(ERROR_LEVEL, ER_SLAVE_FATAL_ERROR,
-                ER_THD(thd, ER_SLAVE_FATAL_ERROR),
-                "Invalid database name in Query event.");
-    thd->is_slave_error = true;
-    goto end;
-  }
-
-  need_inc_rewrite_db_filter_counter = set_thd_db(thd, db, db_len);
-
-  /*
-    Setting the character set and collation of the current database thd->db.
-   */
-  if (get_default_db_collation(thd, thd->db().str, &thd->db_charset)) {
-    assert(thd->is_error() || thd->killed);
-    rli->report(ERROR_LEVEL, thd->get_stmt_da()->mysql_errno(),
-                "Error in get_default_db_collation: %s",
-                thd->get_stmt_da()->message_text());
-    thd->is_slave_error = true;
-    goto end;
-  }
-
-  thd->db_charset = thd->db_charset ? thd->db_charset : thd->collation();
-
-  thd->variables.auto_increment_increment = auto_increment_increment;
-  thd->variables.auto_increment_offset = auto_increment_offset;
-  if (explicit_defaults_ts != TERNARY_UNSET)
-    thd->variables.explicit_defaults_for_timestamp =
-        explicit_defaults_ts == TERNARY_OFF ? false : true;
-
-  /*
-    todo: such cleanup should not be specific to Query event and therefore
-          is preferable at a common with other event pre-execution point
-  */
-  clear_all_errors(thd, const_cast<Relay_log_info *>(rli));
-  if (strcmp("COMMIT", query) == 0 && rli->tables_to_lock != nullptr) {
     /*
-      Cleaning-up the last statement context:
-      the terminal event of the current statement flagged with
-      STMT_END_F got filtered out in ndb circular replication.
+        Colleagues: please never free(thd->catalog) in MySQL. This would
+        lead to bugs as here thd->catalog is a part of an alloced block,
+        not an entire alloced block (see
+        Query_log_event::do_apply_event()). Same for thd->db().str.  Thank
+        you.
     */
-    int error;
-    char llbuff[22];
-    if ((error =
-             rows_event_stmt_cleanup(const_cast<Relay_log_info *>(rli), thd))) {
-      const_cast<Relay_log_info *>(rli)->report(
-          ERROR_LEVEL, error,
-          "Error in cleaning up after an event preceding the commit; "
-          "the group log file/position: %s %s",
-          const_cast<Relay_log_info *>(rli)->get_group_master_log_name(),
-          llstr(const_cast<Relay_log_info *>(rli)->get_group_master_log_pos(),
-                llbuff));
+
+    if (catalog_len)
+    {
+        LEX_CSTRING catalog_lex_cstr = {catalog, catalog_len};
+        thd->set_catalog(catalog_lex_cstr);
     }
-    /*
-      Executing a part of rli->stmt_done() logics that does not deal
-      with group position change. The part is redundant now but is
-      future-change-proof addon, e.g if COMMIT handling will start checking
-      invariants like IN_STMT flag must be off at committing the transaction.
-    */
-    const_cast<Relay_log_info *>(rli)->inc_event_relay_log_pos();
-    const_cast<Relay_log_info *>(rli)->clear_flag(Relay_log_info::IN_STMT);
-  } else {
-    const_cast<Relay_log_info *>(rli)->slave_close_thread_tables(thd);
-  }
+    else
+        thd->set_catalog(EMPTY_CSTR);
 
-  {
-    Applier_security_context_guard security_context{rli, thd};
-    if (!thd->variables.require_row_format) {
-      if (!security_context.skip_priv_checks() &&
-          !security_context.has_access({SUPER_ACL}) &&
-          !security_context.has_access({"SYSTEM_VARIABLES_ADMIN"}) &&
-          !security_context.has_access({"SESSION_VARIABLES_ADMIN"})) {
-        rli->report(ERROR_LEVEL, ER_SPECIFIC_ACCESS_DENIED_ERROR,
-                    ER_THD(thd, ER_SPECIFIC_ACCESS_DENIED_ERROR),
-                    "SUPER, SYSTEM_VARIABLES_ADMIN or SESSION_VARIABLES_ADMIN");
+    bool need_inc_rewrite_db_filter_counter;
+    size_t valid_len;
+    bool len_error;
+    bool is_invalid_db_name =
+        validate_string(system_charset_info, db, db_len, &valid_len, &len_error);
+
+    DBUG_PRINT("debug", ("is_invalid_db_name= %s, valid_len=%zu, len_error=%s",
+                         is_invalid_db_name ? "true" : "false", valid_len,
+                         len_error ? "true" : "false"));
+
+    if (is_invalid_db_name || len_error)
+    {
+        rli->report(ERROR_LEVEL, ER_SLAVE_FATAL_ERROR,
+                    ER_THD(thd, ER_SLAVE_FATAL_ERROR),
+                    "Invalid database name in Query event.");
         thd->is_slave_error = true;
         goto end;
-      }
-      thd->variables.pseudo_thread_id = thread_id;  // for temp tables
     }
 
-    thd->set_time(&(common_header->when));
-    thd->set_query(query_arg, q_len_arg);
-    thd->set_query_for_display(query_arg, q_len_arg);
-    thd->set_query_id(next_query_id());
-    attach_temp_tables_worker(thd, rli);
-    DBUG_PRINT("query", ("%s", thd->query().str));
+    need_inc_rewrite_db_filter_counter = set_thd_db(thd, db, db_len);
 
-    DBUG_EXECUTE_IF("simulate_error_in_ddl", error_code = 1051;);
+    /*
+        Setting the character set and collation of the current database thd->db.
+    */
+    if (get_default_db_collation(thd, thd->db().str, &thd->db_charset))
+    {
+        assert(thd->is_error() || thd->killed);
+        rli->report(ERROR_LEVEL, thd->get_stmt_da()->mysql_errno(),
+                    "Error in get_default_db_collation: %s",
+                    thd->get_stmt_da()->message_text());
+        thd->is_slave_error = true;
+        goto end;
+    }
 
-    if (ignored_error_code((expected_error = error_code)) ||
-        !unexpected_error_code(expected_error)) {
-      if (flags2_inited)
+    thd->db_charset = thd->db_charset ? thd->db_charset : thd->collation();
+
+    thd->variables.auto_increment_increment = auto_increment_increment;
+    thd->variables.auto_increment_offset = auto_increment_offset;
+    if (explicit_defaults_ts != TERNARY_UNSET)
+        thd->variables.explicit_defaults_for_timestamp =
+            explicit_defaults_ts == TERNARY_OFF ? false : true;
+
+    /*
+        todo: such cleanup should not be specific to Query event and therefore
+            is preferable at a common with other event pre-execution point
+    */
+    clear_all_errors(thd, const_cast<Relay_log_info *>(rli));
+    if (strcmp("COMMIT", query) == 0
+        && rli->tables_to_lock != nullptr)
+    {
         /*
-          all bits of thd->variables.option_bits which are 1 in
-          OPTIONS_WRITTEN_TO_BIN_LOG must take their value from flags2.
+            Cleaning-up the last statement context:
+            the terminal event of the current statement flagged with
+            STMT_END_F got filtered out in ndb circular replication.
         */
-        thd->variables.option_bits =
-            flags2 | (thd->variables.option_bits & ~OPTIONS_WRITTEN_TO_BIN_LOG);
-      /*
-        else, we are in a 3.23/4.0 binlog; we previously received a
-        Rotate_log_event which reset thd->variables.option_bits and sql_mode
-        etc, so nothing to do.
-      */
-      /*
-        We do not replicate MODE_NO_DIR_IN_CREATE. That is, if the master is a
-        slave which runs with SQL_MODE=MODE_NO_DIR_IN_CREATE, this should not
-        force us to ignore the dir too. Imagine you are a ring of machines, and
-        one has a disk problem so that you temporarily need
-        MODE_NO_DIR_IN_CREATE on this machine; you don't want it to propagate
-        elsewhere (you don't want all slaves to start ignoring the dirs).
-      */
-      if (sql_mode_inited) {
-        /*
-          All the SQL_MODEs included in 0x1003ff00 were removed in 8.0.5.
-          The upgrade procedure clears these bits. So the bits can only be set
-          when replicating from an older server. We consider it safe to clear
-          the bits, because:
-          (1) all these bits except MAXDB has zero impact on replicated
-          statements, and MAXDB has minimal impact only;
-          (2) the upgrade-pre-check script warns when the bit is set, so we
-          assume users have verified that it is safe to ignore the bit.
-        */
-        if (sql_mode & ~(MODE_ALLOWED_MASK | MODE_IGNORED_MASK)) {
-          my_error(ER_UNSUPPORTED_SQL_MODE, MYF(0),
-                   sql_mode & ~(MODE_ALLOWED_MASK | MODE_IGNORED_MASK));
-          goto compare_errors;
+        int error;
+        char llbuff[22];
+        if ((error = rows_event_stmt_cleanup(const_cast<Relay_log_info *>(rli), thd)))
+        {
+            const_cast<Relay_log_info *>(rli)->report(
+                ERROR_LEVEL, error,
+                "Error in cleaning up after an event preceding the commit; "
+                "the group log file/position: %s %s",
+                const_cast<Relay_log_info *>(rli)->get_group_master_log_name(),
+                llstr(const_cast<Relay_log_info *>(rli)->get_group_master_log_pos(), llbuff));
         }
-        sql_mode &= MODE_ALLOWED_MASK;
-        thd->variables.sql_mode =
-            (sql_mode_t)((thd->variables.sql_mode & MODE_NO_DIR_IN_CREATE) |
-                         (sql_mode & ~(ulonglong)MODE_NO_DIR_IN_CREATE));
-      }
-      if (charset_inited) {
-        if (rli->cached_charset_compare(charset)) {
-          const char *charset_p = charset;  // Avoid type-punning warning.
-          /* Verify that we support the charsets found in the event. */
-          if (!(thd->variables.character_set_client =
-                    get_charset(uint2korr(charset_p), MYF(MY_WME))) ||
-              !(thd->variables.collation_connection =
-                    get_charset(uint2korr(charset + 2), MYF(MY_WME))) ||
-              !(thd->variables.collation_server =
-                    get_charset(uint2korr(charset + 4), MYF(MY_WME)))) {
+        /*
+            Executing a part of rli->stmt_done() logics that does not deal
+            with group position change. The part is redundant now but is
+            future-change-proof addon, e.g if COMMIT handling will start checking
+            invariants like IN_STMT flag must be off at committing the transaction.
+        */
+        const_cast<Relay_log_info *>(rli)->inc_event_relay_log_pos();
+        const_cast<Relay_log_info *>(rli)->clear_flag(Relay_log_info::IN_STMT);
+    }
+    else
+    {
+        const_cast<Relay_log_info *>(rli)->slave_close_thread_tables(thd);
+    }
+
+    {
+        Applier_security_context_guard security_context{rli, thd};
+        if (!thd->variables.require_row_format)
+        {
+            if (!security_context.skip_priv_checks()
+                && !security_context.has_access({SUPER_ACL})
+                && !security_context.has_access({"SYSTEM_VARIABLES_ADMIN"})
+                && !security_context.has_access({"SESSION_VARIABLES_ADMIN"}))
+            {
+                rli->report(ERROR_LEVEL, ER_SPECIFIC_ACCESS_DENIED_ERROR,
+                            ER_THD(thd, ER_SPECIFIC_ACCESS_DENIED_ERROR),
+                            "SUPER, SYSTEM_VARIABLES_ADMIN or SESSION_VARIABLES_ADMIN");
+                thd->is_slave_error = true;
+                goto end;
+            }
+            thd->variables.pseudo_thread_id = thread_id;  // for temp tables
+        }
+
+        thd->set_time(&(common_header->when));
+        thd->set_query(query_arg, q_len_arg);
+        thd->set_query_for_display(query_arg, q_len_arg);
+        thd->set_query_id(next_query_id());
+        attach_temp_tables_worker(thd, rli);
+        DBUG_PRINT("query", ("%s", thd->query().str));
+
+        DBUG_EXECUTE_IF("simulate_error_in_ddl", error_code = 1051;);
+
+        if (ignored_error_code((expected_error = error_code))
+            || !unexpected_error_code(expected_error))
+        {
+            if (flags2_inited)
+                /*
+                all bits of thd->variables.option_bits which are 1 in
+                OPTIONS_WRITTEN_TO_BIN_LOG must take their value from flags2.
+                */
+                thd->variables.option_bits =
+                    flags2 | (thd->variables.option_bits & ~OPTIONS_WRITTEN_TO_BIN_LOG);
             /*
-              We updated the thd->variables with nonsensical values (0). Let's
-              set them to something safe (i.e. which avoids crash), and we'll
-              stop with EE_UNKNOWN_CHARSET in compare_errors (unless set to
-              ignore this error).
+                else, we are in a 3.23/4.0 binlog; we previously received a
+                Rotate_log_event which reset thd->variables.option_bits and sql_mode
+                etc, so nothing to do.
             */
-            set_slave_thread_default_charset(thd, rli);
-            goto compare_errors;
-          }
-          thd->update_charset();  // for the charset change to take effect
-          /*
-            We cannot ask for parsing a statement using a character set
-            without state_maps (parser internal data).
-          */
-          if (!thd->variables.character_set_client->state_maps) {
-            rli->report(ERROR_LEVEL, ER_SLAVE_FATAL_ERROR,
-                        ER_THD(thd, ER_SLAVE_FATAL_ERROR),
-                        "character_set cannot be parsed");
-            thd->is_slave_error = true;
+            /*
+                We do not replicate MODE_NO_DIR_IN_CREATE. That is, if the master is a
+                slave which runs with SQL_MODE=MODE_NO_DIR_IN_CREATE, this should not
+                force us to ignore the dir too. Imagine you are a ring of machines, and
+                one has a disk problem so that you temporarily need
+                MODE_NO_DIR_IN_CREATE on this machine; you don't want it to propagate
+                elsewhere (you don't want all slaves to start ignoring the dirs).
+            */
+            if (sql_mode_inited) {
+                /*
+                All the SQL_MODEs included in 0x1003ff00 were removed in 8.0.5.
+                The upgrade procedure clears these bits. So the bits can only be set
+                when replicating from an older server. We consider it safe to clear
+                the bits, because:
+                (1) all these bits except MAXDB has zero impact on replicated
+                statements, and MAXDB has minimal impact only;
+                (2) the upgrade-pre-check script warns when the bit is set, so we
+                assume users have verified that it is safe to ignore the bit.
+                */
+                if (sql_mode & ~(MODE_ALLOWED_MASK | MODE_IGNORED_MASK)) {
+                my_error(ER_UNSUPPORTED_SQL_MODE, MYF(0),
+                        sql_mode & ~(MODE_ALLOWED_MASK | MODE_IGNORED_MASK));
+                goto compare_errors;
+                }
+                sql_mode &= MODE_ALLOWED_MASK;
+                thd->variables.sql_mode =
+                    (sql_mode_t)((thd->variables.sql_mode & MODE_NO_DIR_IN_CREATE) |
+                                (sql_mode & ~(ulonglong)MODE_NO_DIR_IN_CREATE));
+            }
+            if (charset_inited) {
+                if (rli->cached_charset_compare(charset)) {
+                const char *charset_p = charset;  // Avoid type-punning warning.
+                /* Verify that we support the charsets found in the event. */
+                if (!(thd->variables.character_set_client =
+                            get_charset(uint2korr(charset_p), MYF(MY_WME))) ||
+                    !(thd->variables.collation_connection =
+                            get_charset(uint2korr(charset + 2), MYF(MY_WME))) ||
+                    !(thd->variables.collation_server =
+                            get_charset(uint2korr(charset + 4), MYF(MY_WME)))) {
+                    /*
+                    We updated the thd->variables with nonsensical values (0). Let's
+                    set them to something safe (i.e. which avoids crash), and we'll
+                    stop with EE_UNKNOWN_CHARSET in compare_errors (unless set to
+                    ignore this error).
+                    */
+                    set_slave_thread_default_charset(thd, rli);
+                    goto compare_errors;
+                }
+                thd->update_charset();  // for the charset change to take effect
+                /*
+                    We cannot ask for parsing a statement using a character set
+                    without state_maps (parser internal data).
+                */
+                if (!thd->variables.character_set_client->state_maps) {
+                    rli->report(ERROR_LEVEL, ER_SLAVE_FATAL_ERROR,
+                                ER_THD(thd, ER_SLAVE_FATAL_ERROR),
+                                "character_set cannot be parsed");
+                    thd->is_slave_error = true;
+                    goto end;
+                }
+                /*
+                    Reset thd->query_string.cs to the newly set value.
+                    Note, there is a small flaw here. For a very short time frame
+                    if the new charset is different from the old charset and
+                    if another thread executes "SHOW PROCESSLIST" after
+                    the above thd->set_query() and before this thd->set_query(),
+                    and if the current query has some non-ASCII characters,
+                    the another thread may see some '?' marks in the PROCESSLIST
+                    result. This should be acceptable now. This is a reminder
+                    to fix this if any refactoring happens here sometime.
+                */
+                thd->set_query(query_arg, q_len_arg);
+                thd->reset_query_for_display();
+                }
+            }
+            if (time_zone_len) {
+                String tmp(time_zone_str, time_zone_len, &my_charset_bin);
+                if (!(thd->variables.time_zone = my_tz_find(thd, &tmp))) {
+                my_error(ER_UNKNOWN_TIME_ZONE, MYF(0), tmp.c_ptr());
+                thd->variables.time_zone = global_system_variables.time_zone;
+                goto compare_errors;
+                }
+            }
+            if (lc_time_names_number) {
+                if (!(thd->variables.lc_time_names =
+                        my_locale_by_number(lc_time_names_number))) {
+                my_printf_error(ER_UNKNOWN_ERROR, "Unknown locale: '%d'", MYF(0),
+                                lc_time_names_number);
+                thd->variables.lc_time_names = &my_locale_en_US;
+                goto compare_errors;
+                }
+            } else
+                thd->variables.lc_time_names = &my_locale_en_US;
+            if (charset_database_number) {
+                CHARSET_INFO *cs;
+                if (!(cs = get_charset(charset_database_number, MYF(0)))) {
+                char buf[20];
+                longlong10_to_str(charset_database_number, buf, 10);
+                my_error(ER_UNKNOWN_COLLATION, MYF(0), buf);
+                goto compare_errors;
+                }
+                thd->variables.collation_database = cs;
+            } else
+                thd->variables.collation_database = thd->db_charset;
+            if (default_collation_for_utf8mb4_number) {
+                CHARSET_INFO *cs;
+                if (!(cs = get_charset(default_collation_for_utf8mb4_number, MYF(0)))) {
+                char buf[20];
+                longlong10_to_str(default_collation_for_utf8mb4_number, buf, 10);
+                my_error(ER_UNKNOWN_COLLATION, MYF(0), buf);
+                goto compare_errors;
+                }
+                thd->variables.default_collation_for_utf8mb4 = cs;
+            } else
+                // The transaction was replicated from a server with utf8mb4_general_ci
+                // as default collation for utf8mb4 (versions 5.7-)
+                thd->variables.default_collation_for_utf8mb4 =
+                    &my_charset_utf8mb4_general_ci;
+
+            if (sql_require_primary_key != 0xff &&
+                Relay_log_info::PK_CHECK_STREAM ==
+                    rli->get_require_table_primary_key_check()) {
+                assert(sql_require_primary_key == 0 || sql_require_primary_key == 1);
+                if (!security_context.skip_priv_checks() &&
+                    !security_context.has_access({SUPER_ACL}) &&
+                    !security_context.has_access({"SYSTEM_VARIABLES_ADMIN"}) &&
+                    !security_context.has_access({"SESSION_VARIABLES_ADMIN"})) {
+                rli->report(
+                    ERROR_LEVEL, ER_SPECIFIC_ACCESS_DENIED_ERROR,
+                    ER_THD(thd, ER_SPECIFIC_ACCESS_DENIED_ERROR),
+                    "SUPER, SYSTEM_VARIABLES_ADMIN or SESSION_VARIABLES_ADMIN");
+                thd->is_slave_error = true;
+                goto end;
+                }
+                thd->variables.sql_require_primary_key = sql_require_primary_key;
+            }
+
+            if (default_table_encryption != 0xff) {
+                assert(default_table_encryption == 0 || default_table_encryption == 1);
+                if (thd->variables.default_table_encryption !=
+                        default_table_encryption &&
+                    !security_context.skip_priv_checks() &&
+                    !security_context.has_access({SUPER_ACL}) &&
+                    !security_context.has_access(
+                        {"SYSTEM_VARIABLES_ADMIN", "TABLE_ENCRYPTION_ADMIN"})) {
+                rli->report(
+                    ERROR_LEVEL, ER_SPECIFIC_ACCESS_DENIED_ERROR,
+                    ER_THD(thd, ER_SPECIFIC_ACCESS_DENIED_ERROR),
+                    "SUPER or SYSTEM_VARIABLES_ADMIN and TABLE_ENCRYPTION_ADMIN");
+                thd->is_slave_error = true;
+                goto end;
+                }
+                thd->variables.default_table_encryption = default_table_encryption;
+            }
+
+            thd->table_map_for_update = (table_map)table_map_for_update;
+
+            LEX_STRING user_lex = LEX_STRING();
+            LEX_STRING host_lex = LEX_STRING();
+            if (user) {
+                user_lex.str = const_cast<char *>(user);
+                user_lex.length = strlen(user);
+            }
+            if (host) {
+                host_lex.str = const_cast<char *>(host);
+                host_lex.length = strlen(host);
+            }
+            thd->set_invoker(&user_lex, &host_lex);
+
+            /*
+                Flag if we need to rollback the statement transaction on
+                slave if it by chance succeeds.
+                If we expected a non-zero error code and get nothing and,
+                it is a concurrency issue or ignorable issue, effects
+                of the statement should be rolled back.
+            */
+            if (expected_error && (ignored_error_code(expected_error) ||
+                                    concurrency_error_code(expected_error))) {
+                thd->variables.option_bits |= OPTION_MASTER_SQL_ERROR;
+            }
+            /* Execute the query (note that we bypass dispatch_command()) */
+            Parser_state parser_state;
+            if (!parser_state.init(thd, thd->query().str, thd->query().length)) {
+                assert(thd->m_digest == nullptr);
+                thd->m_digest = &thd->m_digest_state;
+                assert(thd->m_statement_psi == nullptr);
+                thd->m_statement_psi = MYSQL_START_STATEMENT(
+                    &thd->m_statement_state, stmt_info_rpl.m_key, thd->db().str,
+                    thd->db().length, thd->charset(), nullptr);
+                THD_STAGE_INFO(thd, stage_starting);
+
+                if (thd->m_digest != nullptr)
+                thd->m_digest->reset(thd->m_token_array, max_digest_length);
+
+                struct System_status_var query_start_status;
+                struct System_status_var *query_start_status_ptr = nullptr;
+                if (opt_log_slow_extra) {
+                query_start_status_ptr = &query_start_status;
+                query_start_status = thd->status_var;
+                }
+
+                dispatch_sql_command(thd, &parser_state);
+
+                enum_sql_command command = thd->lex->sql_command;
+
+                /*
+                Transaction isolation level of pure row based replicated transactions
+                can be optimized to ISO_READ_COMMITTED by the applier when applying
+                the Gtid_log_event.
+
+                If we are applying a statement other than transaction control ones
+                after having optimized the transactions isolation level, we must warn
+                about the non-standard situation we have found.
+                */
+                if (is_sbr_logging_format() &&
+                    thd->variables.transaction_isolation > ISO_READ_COMMITTED &&
+                    thd->tx_isolation == ISO_READ_COMMITTED) {
+                String message;
+                message.append(
+                    "The isolation level for the current transaction "
+                    "was changed to READ_COMMITTED based on the "
+                    "assumption that it had only row events and was "
+                    "not mixed with statements. "
+                    "However, an unexpected statement was found in "
+                    "the middle of the transaction."
+                    "Query: '");
+                message.append(thd->query().str);
+                message.append("'");
+                rli->report(ERROR_LEVEL, ER_SLAVE_FATAL_ERROR,
+                            ER_THD(thd, ER_SLAVE_FATAL_ERROR), message.c_ptr());
+                thd->is_slave_error = true;
+                goto end;
+                }
+
+                /*
+                Do not need to increase rewrite_db_filter counter for
+                SQLCOM_CREATE_DB, SQLCOM_DROP_DB, SQLCOM_BEGIN and
+                SQLCOM_COMMIT.
+                */
+                if (need_inc_rewrite_db_filter_counter && command != SQLCOM_CREATE_DB &&
+                    command != SQLCOM_DROP_DB && command != SQLCOM_BEGIN &&
+                    command != SQLCOM_COMMIT) {
+                Rpl_filter *rpl_filter = thd->rli_slave->rpl_filter;
+                if (rpl_filter)
+                    rpl_filter->get_rewrite_db_statistics()->increase_counter();
+                }
+                /* Finalize server status flags after executing a statement. */
+                thd->update_slow_query_status();
+                log_slow_statement(thd, query_start_status_ptr);
+            }
+
+            thd->variables.option_bits &= ~OPTION_MASTER_SQL_ERROR;
+
+            /*
+                Resetting the enable_slow_log thd variable.
+
+                We need to reset it back to the opt_log_slow_replica_statements
+                value after the statement execution (and slow logging
+                is done). It might have changed if the statement was an
+                admin statement (in which case, down in dispatch_sql_command execution
+                thd->enable_slow_log is set to the value of
+                opt_log_slow_admin_statements).
+            */
+            thd->enable_slow_log = opt_log_slow_replica_statements;
+        }
+        else
+        {
+            /*
+                The query got a really bad error on the master (thread killed etc),
+                which could be inconsistent. Parse it to test the table names: if the
+                replicate-*-do|ignore-table rules say "this query must be ignored" then
+                we exit gracefully; otherwise we warn about the bad error and tell DBA
+                to check/fix it.
+            */
+            if (mysql_test_parse_for_slave(thd))
+                clear_all_errors(
+                    thd, const_cast<Relay_log_info *>(rli)); /* Can ignore query */
+            else {
+                rli->report(ERROR_LEVEL, ER_ERROR_ON_MASTER,
+                            ER_THD(thd, ER_ERROR_ON_MASTER), expected_error,
+                            thd->query().str);
+                thd->is_slave_error = true;
+            }
             goto end;
-          }
-          /*
-            Reset thd->query_string.cs to the newly set value.
-            Note, there is a small flaw here. For a very short time frame
-            if the new charset is different from the old charset and
-            if another thread executes "SHOW PROCESSLIST" after
-            the above thd->set_query() and before this thd->set_query(),
-            and if the current query has some non-ASCII characters,
-            the another thread may see some '?' marks in the PROCESSLIST
-            result. This should be acceptable now. This is a reminder
-            to fix this if any refactoring happens here sometime.
-          */
-          thd->set_query(query_arg, q_len_arg);
-          thd->reset_query_for_display();
         }
-      }
-      if (time_zone_len) {
-        String tmp(time_zone_str, time_zone_len, &my_charset_bin);
-        if (!(thd->variables.time_zone = my_tz_find(thd, &tmp))) {
-          my_error(ER_UNKNOWN_TIME_ZONE, MYF(0), tmp.c_ptr());
-          thd->variables.time_zone = global_system_variables.time_zone;
-          goto compare_errors;
-        }
-      }
-      if (lc_time_names_number) {
-        if (!(thd->variables.lc_time_names =
-                  my_locale_by_number(lc_time_names_number))) {
-          my_printf_error(ER_UNKNOWN_ERROR, "Unknown locale: '%d'", MYF(0),
-                          lc_time_names_number);
-          thd->variables.lc_time_names = &my_locale_en_US;
-          goto compare_errors;
-        }
-      } else
-        thd->variables.lc_time_names = &my_locale_en_US;
-      if (charset_database_number) {
-        CHARSET_INFO *cs;
-        if (!(cs = get_charset(charset_database_number, MYF(0)))) {
-          char buf[20];
-          longlong10_to_str(charset_database_number, buf, 10);
-          my_error(ER_UNKNOWN_COLLATION, MYF(0), buf);
-          goto compare_errors;
-        }
-        thd->variables.collation_database = cs;
-      } else
-        thd->variables.collation_database = thd->db_charset;
-      if (default_collation_for_utf8mb4_number) {
-        CHARSET_INFO *cs;
-        if (!(cs = get_charset(default_collation_for_utf8mb4_number, MYF(0)))) {
-          char buf[20];
-          longlong10_to_str(default_collation_for_utf8mb4_number, buf, 10);
-          my_error(ER_UNKNOWN_COLLATION, MYF(0), buf);
-          goto compare_errors;
-        }
-        thd->variables.default_collation_for_utf8mb4 = cs;
-      } else
-        // The transaction was replicated from a server with utf8mb4_general_ci
-        // as default collation for utf8mb4 (versions 5.7-)
-        thd->variables.default_collation_for_utf8mb4 =
-            &my_charset_utf8mb4_general_ci;
+        /* If the query was not ignored, it is printed to the general log */
+        if (!thd->is_error()
+            || thd->get_stmt_da()->mysql_errno() != ER_SLAVE_IGNORED_TABLE)
+        {
+            /*
+                Log the rewritten query if the query was rewritten
+                and the option to log raw was not set.
 
-      if (sql_require_primary_key != 0xff &&
-          Relay_log_info::PK_CHECK_STREAM ==
-              rli->get_require_table_primary_key_check()) {
-        assert(sql_require_primary_key == 0 || sql_require_primary_key == 1);
-        if (!security_context.skip_priv_checks() &&
-            !security_context.has_access({SUPER_ACL}) &&
-            !security_context.has_access({"SYSTEM_VARIABLES_ADMIN"}) &&
-            !security_context.has_access({"SESSION_VARIABLES_ADMIN"})) {
-          rli->report(
-              ERROR_LEVEL, ER_SPECIFIC_ACCESS_DENIED_ERROR,
-              ER_THD(thd, ER_SPECIFIC_ACCESS_DENIED_ERROR),
-              "SUPER, SYSTEM_VARIABLES_ADMIN or SESSION_VARIABLES_ADMIN");
-          thd->is_slave_error = true;
-          goto end;
-        }
-        thd->variables.sql_require_primary_key = sql_require_primary_key;
-      }
-
-      if (default_table_encryption != 0xff) {
-        assert(default_table_encryption == 0 || default_table_encryption == 1);
-        if (thd->variables.default_table_encryption !=
-                default_table_encryption &&
-            !security_context.skip_priv_checks() &&
-            !security_context.has_access({SUPER_ACL}) &&
-            !security_context.has_access(
-                {"SYSTEM_VARIABLES_ADMIN", "TABLE_ENCRYPTION_ADMIN"})) {
-          rli->report(
-              ERROR_LEVEL, ER_SPECIFIC_ACCESS_DENIED_ERROR,
-              ER_THD(thd, ER_SPECIFIC_ACCESS_DENIED_ERROR),
-              "SUPER or SYSTEM_VARIABLES_ADMIN and TABLE_ENCRYPTION_ADMIN");
-          thd->is_slave_error = true;
-          goto end;
-        }
-        thd->variables.default_table_encryption = default_table_encryption;
-      }
-
-      thd->table_map_for_update = (table_map)table_map_for_update;
-
-      LEX_STRING user_lex = LEX_STRING();
-      LEX_STRING host_lex = LEX_STRING();
-      if (user) {
-        user_lex.str = const_cast<char *>(user);
-        user_lex.length = strlen(user);
-      }
-      if (host) {
-        host_lex.str = const_cast<char *>(host);
-        host_lex.length = strlen(host);
-      }
-      thd->set_invoker(&user_lex, &host_lex);
-
-      /*
-        Flag if we need to rollback the statement transaction on
-        slave if it by chance succeeds.
-        If we expected a non-zero error code and get nothing and,
-        it is a concurrency issue or ignorable issue, effects
-        of the statement should be rolled back.
-      */
-      if (expected_error && (ignored_error_code(expected_error) ||
-                             concurrency_error_code(expected_error))) {
-        thd->variables.option_bits |= OPTION_MASTER_SQL_ERROR;
-      }
-      /* Execute the query (note that we bypass dispatch_command()) */
-      Parser_state parser_state;
-      if (!parser_state.init(thd, thd->query().str, thd->query().length)) {
-        assert(thd->m_digest == nullptr);
-        thd->m_digest = &thd->m_digest_state;
-        assert(thd->m_statement_psi == nullptr);
-        thd->m_statement_psi = MYSQL_START_STATEMENT(
-            &thd->m_statement_state, stmt_info_rpl.m_key, thd->db().str,
-            thd->db().length, thd->charset(), nullptr);
-        THD_STAGE_INFO(thd, stage_starting);
-
-        if (thd->m_digest != nullptr)
-          thd->m_digest->reset(thd->m_token_array, max_digest_length);
-
-        struct System_status_var query_start_status;
-        struct System_status_var *query_start_status_ptr = nullptr;
-        if (opt_log_slow_extra) {
-          query_start_status_ptr = &query_start_status;
-          query_start_status = thd->status_var;
+                There is an assumption here. We assume that query log
+                events can never have multi-statement queries, thus the
+                parsed statement is the same as the raw one.
+            */
+            if (opt_general_log_raw || thd->rewritten_query().length() == 0)
+                query_logger.general_log_write(thd, COM_QUERY, thd->query().str,
+                                            thd->query().length);
+            else
+                query_logger.general_log_write(thd, COM_QUERY,
+                                            thd->rewritten_query().ptr(),
+                                            thd->rewritten_query().length());
         }
 
-        dispatch_sql_command(thd, &parser_state);
-
-        enum_sql_command command = thd->lex->sql_command;
-
+compare_errors:
+        /* Parser errors shall be ignored when (GTID) skipping statements */
+        if (thd->is_error()
+            && thd->get_stmt_da()->mysql_errno() == ER_PARSE_ERROR
+            && gtid_pre_statement_checks(thd) == GTID_STATEMENT_SKIP)
+        {
+            thd->get_stmt_da()->reset_diagnostics_area();
+        }
         /*
-          Transaction isolation level of pure row based replicated transactions
-          can be optimized to ISO_READ_COMMITTED by the applier when applying
-          the Gtid_log_event.
-
-          If we are applying a statement other than transaction control ones
-          after having optimized the transactions isolation level, we must warn
-          about the non-standard situation we have found.
+            In the slave thread, we may sometimes execute some DROP / * 40005
+            TEMPORARY * / TABLE that come from parts of binlogs (likely if we
+            use RESET SLAVE or CHANGE MASTER TO), while the temporary table
+            has already been dropped. To ignore such irrelevant "table does
+            not exist errors", we silently clear the error if TEMPORARY was used.
         */
-        if (is_sbr_logging_format() &&
-            thd->variables.transaction_isolation > ISO_READ_COMMITTED &&
-            thd->tx_isolation == ISO_READ_COMMITTED) {
-          String message;
-          message.append(
-              "The isolation level for the current transaction "
-              "was changed to READ_COMMITTED based on the "
-              "assumption that it had only row events and was "
-              "not mixed with statements. "
-              "However, an unexpected statement was found in "
-              "the middle of the transaction."
-              "Query: '");
-          message.append(thd->query().str);
-          message.append("'");
-          rli->report(ERROR_LEVEL, ER_SLAVE_FATAL_ERROR,
-                      ER_THD(thd, ER_SLAVE_FATAL_ERROR), message.c_ptr());
-          thd->is_slave_error = true;
-          goto end;
+        if (thd->lex->sql_command == SQLCOM_DROP_TABLE
+            && thd->lex->drop_temporary && thd->is_error()
+            && thd->get_stmt_da()->mysql_errno() == ER_BAD_TABLE_ERROR
+            && !expected_error)
+        {
+            thd->get_stmt_da()->reset_diagnostics_area();
+            // Flag drops for error-ignored DDL to advance execution coordinates.
+            has_ddl_committed = false;
+        }
+        /*
+            If we expected a non-zero error code, and we don't get the same error
+            code, and it should be ignored or is related to a concurrency issue.
+        */
+        actual_error = thd->is_error() ? thd->get_stmt_da()->mysql_errno() : 0;
+        DBUG_PRINT("info", ("expected_error: %d  sql_errno: %d", expected_error,
+                            actual_error));
+
+        if (actual_error != 0 && expected_error == actual_error)
+        {
+            if (!has_ddl_committed  // Slave didn't commit a DDL
+                && ddl_xid == binary_log::INVALID_XID  // The event was not logged as
+                                                        // atomic DDL on master
+                && !thd->rli_slave->ddl_not_atomic  // The DDL was considered atomic
+                                                    // by the slave
+                && is_atomic_ddl(thd, true))  // The DDL is atomic for the local server
+            {
+                thd->get_stmt_da()->reset_diagnostics_area();
+                my_error(ER_SLAVE_POSSIBLY_DIVERGED_AFTER_DDL, MYF(0), 0);
+                actual_error = ER_SLAVE_POSSIBLY_DIVERGED_AFTER_DDL;
+            }
         }
 
         /*
-          Do not need to increase rewrite_db_filter counter for
-          SQLCOM_CREATE_DB, SQLCOM_DROP_DB, SQLCOM_BEGIN and
-          SQLCOM_COMMIT.
+            If a statement with expected error is received on slave and if the
+            statement is not filtered on the slave, only then compare the expected
+            error with the actual error that happened on slave.
         */
-        if (need_inc_rewrite_db_filter_counter && command != SQLCOM_CREATE_DB &&
-            command != SQLCOM_DROP_DB && command != SQLCOM_BEGIN &&
-            command != SQLCOM_COMMIT) {
-          Rpl_filter *rpl_filter = thd->rli_slave->rpl_filter;
-          if (rpl_filter)
-            rpl_filter->get_rewrite_db_statistics()->increase_counter();
+        if ((
+             expected_error
+             && rli->rpl_filter->db_ok(thd->db().str)
+             && expected_error != actual_error
+             && !concurrency_error_code(expected_error)
+            )
+            &&!ignored_error_code(actual_error)
+            && !ignored_error_code(expected_error))
+        {
+            if (!ignored_error_code(ER_INCONSISTENT_ERROR))
+            {
+                rli->report(
+                    ERROR_LEVEL, ER_INCONSISTENT_ERROR,
+                    ER_THD(thd, ER_INCONSISTENT_ERROR),
+                    ER_THD_NONCONST(thd, expected_error), expected_error,
+                    (actual_error ? thd->get_stmt_da()->message_text() : "no error"),
+                    actual_error, print_slave_db_safe(db), query_arg);
+                thd->is_slave_error = true;
+            }
+            else
+            {
+                rli->report(
+                    INFORMATION_LEVEL, actual_error,
+                    "The actual error and expected error on slave are"
+                    " different that will result in ER_INCONSISTENT_ERROR but"
+                    " that is passed as an argument to replica_skip_errors so no"
+                    " error is thrown. "
+                    "The expected error was %s with, Error_code: %d. "
+                    "The actual error is %s with ",
+                    ER_THD_NONCONST(thd, expected_error), expected_error,
+                    thd->get_stmt_da()->message_text());
+                clear_all_errors(thd, const_cast<Relay_log_info *>(rli));
+            }
         }
-        /* Finalize server status flags after executing a statement. */
-        thd->update_slow_query_status();
-        log_slow_statement(thd, query_start_status_ptr);
-      }
+        /*
+            If we get the same error code as expected and it is not a concurrency
+            issue, or should be ignored.
+        */
+        else if ((expected_error == actual_error &&
+                !concurrency_error_code(expected_error)) ||
+                ignored_error_code(actual_error))
+        {
+            DBUG_PRINT("info", ("error ignored"));
+            if (actual_error && ignored_error_code(actual_error))
+            {
+                if (actual_error == ER_SLAVE_IGNORED_TABLE)
+                {
+                    if (!slave_ignored_err_throttle.log())
+                        rli->report(INFORMATION_LEVEL, actual_error,
+                                    "Could not execute %s event. Detailed error: %s;"
+                                    " Error log throttle is enabled. This error will not be"
+                                    " displayed for next %lu secs. It will be suppressed",
+                                    get_type_str(), thd->get_stmt_da()->message_text(),
+                                    (window_size / 1000000));
+                }
+                else
+                    rli->report(INFORMATION_LEVEL, actual_error,
+                                "Could not execute %s event. Detailed error: %s;",
+                                get_type_str(), thd->get_stmt_da()->message_text());
+            }
+            has_ddl_committed = false;  // The same comments as above.
+            clear_all_errors(thd, const_cast<Relay_log_info *>(rli));
+            thd->killed = THD::NOT_KILLED;
+        }
+        /*
+            Other cases: mostly we expected no error and get one.
+        */
+        else if (thd->is_slave_error || thd->is_fatal_error())
+        {
+            if (!is_silent_error(thd))
+            {
+                rli->report(ERROR_LEVEL, actual_error,
+                            "Error '%s' on query. Default database: '%s'. Query: '%s'",
+                            (actual_error ? thd->get_stmt_da()->message_text()
+                                        : "unexpected success or fatal error"),
+                            print_slave_db_safe(thd->db().str), query_arg);
+            }
+            thd->is_slave_error = true;
+        }
 
-      thd->variables.option_bits &= ~OPTION_MASTER_SQL_ERROR;
+        /*
+            TODO: compare the values of "affected rows" around here. Something
+            like:
+            if ((uint32) affected_in_event != (uint32) affected_on_slave)
+            {
+            sql_print_error("Slave: did not get the expected number of affected "
+            "rows running query from master - expected %d, got %d (this numbers "
+            "should have matched modulo 4294967296).", 0, ...);
+            thd->is_slave_error = 1;
+            }
+            We may also want an option to tell the slave to ignore "affected"
+            mismatch. This mismatch could be implemented with a new ER_ code, and
+            to ignore it you would use --replica-skip-errors...
 
-      /*
-        Resetting the enable_slow_log thd variable.
+            To do the comparison we need to know the value of "affected" which the
+            above dispatch_sql_command() computed. And we need to know the value of
+            "affected" in the master's binlog. Both will be implemented later. The
+            important thing is that we now have the format ready to log the values
+            of "affected" in the binlog. So we can release 5.0.0 before effectively
+            logging "affected" and effectively comparing it.
+        */
+    } /* End of if (db_ok(... */
 
-        We need to reset it back to the opt_log_slow_replica_statements
-        value after the statement execution (and slow logging
-        is done). It might have changed if the statement was an
-        admin statement (in which case, down in dispatch_sql_command execution
-        thd->enable_slow_log is set to the value of
-        opt_log_slow_admin_statements).
-      */
-      thd->enable_slow_log = opt_log_slow_replica_statements;
-    } else {
-      /*
-        The query got a really bad error on the master (thread killed etc),
-        which could be inconsistent. Parse it to test the table names: if the
-        replicate-*-do|ignore-table rules say "this query must be ignored" then
-        we exit gracefully; otherwise we warn about the bad error and tell DBA
-        to check/fix it.
-      */
-      if (mysql_test_parse_for_slave(thd))
-        clear_all_errors(
-            thd, const_cast<Relay_log_info *>(rli)); /* Can ignore query */
-      else {
-        rli->report(ERROR_LEVEL, ER_ERROR_ON_MASTER,
-                    ER_THD(thd, ER_ERROR_ON_MASTER), expected_error,
-                    thd->query().str);
-        thd->is_slave_error = true;
-      }
-      goto end;
+    {
+        /**
+         The following failure injecion works in cooperation with tests
+        setting @@global.debug= 'd,stop_replica_middle_group'.
+        The sql thread receives the killed status and will proceed
+        to shutdown trying to finish incomplete events group.
+        */
+
+        // TODO: address the middle-group killing in MTS case
+
+        DBUG_EXECUTE_IF(
+            "stop_replica_middle_group",
+            if (strcmp("COMMIT", query) != 0 && strcmp("BEGIN", query) != 0) {
+            if (thd->get_transaction()->cannot_safely_rollback(
+                    Transaction_ctx::SESSION))
+                const_cast<Relay_log_info *>(rli)->abort_slave = 1;
+            };);
     }
-    /* If the query was not ignored, it is printed to the general log */
-    if (!thd->is_error() ||
-        thd->get_stmt_da()->mysql_errno() != ER_SLAVE_IGNORED_TABLE) {
-      /*
-        Log the rewritten query if the query was rewritten
-        and the option to log raw was not set.
-
-        There is an assumption here. We assume that query log
-        events can never have multi-statement queries, thus the
-        parsed statement is the same as the raw one.
-      */
-      if (opt_general_log_raw || thd->rewritten_query().length() == 0)
-        query_logger.general_log_write(thd, COM_QUERY, thd->query().str,
-                                       thd->query().length);
-      else
-        query_logger.general_log_write(thd, COM_QUERY,
-                                       thd->rewritten_query().ptr(),
-                                       thd->rewritten_query().length());
-    }
-
-  compare_errors:
-    /* Parser errors shall be ignored when (GTID) skipping statements */
-    if (thd->is_error() &&
-        thd->get_stmt_da()->mysql_errno() == ER_PARSE_ERROR &&
-        gtid_pre_statement_checks(thd) == GTID_STATEMENT_SKIP) {
-      thd->get_stmt_da()->reset_diagnostics_area();
-    }
-    /*
-      In the slave thread, we may sometimes execute some DROP / * 40005
-      TEMPORARY * / TABLE that come from parts of binlogs (likely if we
-      use RESET SLAVE or CHANGE MASTER TO), while the temporary table
-      has already been dropped. To ignore such irrelevant "table does
-      not exist errors", we silently clear the error if TEMPORARY was used.
-    */
-    if (thd->lex->sql_command == SQLCOM_DROP_TABLE &&
-        thd->lex->drop_temporary && thd->is_error() &&
-        thd->get_stmt_da()->mysql_errno() == ER_BAD_TABLE_ERROR &&
-        !expected_error) {
-      thd->get_stmt_da()->reset_diagnostics_area();
-      // Flag drops for error-ignored DDL to advance execution coordinates.
-      has_ddl_committed = false;
-    }
-    /*
-      If we expected a non-zero error code, and we don't get the same error
-      code, and it should be ignored or is related to a concurrency issue.
-    */
-    actual_error = thd->is_error() ? thd->get_stmt_da()->mysql_errno() : 0;
-    DBUG_PRINT("info", ("expected_error: %d  sql_errno: %d", expected_error,
-                        actual_error));
-
-    if (actual_error != 0 && expected_error == actual_error) {
-      if (!has_ddl_committed &&                  // Slave didn't commit a DDL
-          ddl_xid == binary_log::INVALID_XID &&  // The event was not logged as
-                                                 // atomic DDL on master
-          !thd->rli_slave->ddl_not_atomic &&  // The DDL was considered atomic
-                                              // by the slave
-          is_atomic_ddl(thd, true))  // The DDL is atomic for the local server
-      {
-        thd->get_stmt_da()->reset_diagnostics_area();
-        my_error(ER_SLAVE_POSSIBLY_DIVERGED_AFTER_DDL, MYF(0), 0);
-        actual_error = ER_SLAVE_POSSIBLY_DIVERGED_AFTER_DDL;
-      }
-    }
-
-    /*
-      If a statement with expected error is received on slave and if the
-      statement is not filtered on the slave, only then compare the expected
-      error with the actual error that happened on slave.
-    */
-    if ((expected_error && rli->rpl_filter->db_ok(thd->db().str) &&
-         expected_error != actual_error &&
-         !concurrency_error_code(expected_error)) &&
-        !ignored_error_code(actual_error) &&
-        !ignored_error_code(expected_error)) {
-      if (!ignored_error_code(ER_INCONSISTENT_ERROR)) {
-        rli->report(
-            ERROR_LEVEL, ER_INCONSISTENT_ERROR,
-            ER_THD(thd, ER_INCONSISTENT_ERROR),
-            ER_THD_NONCONST(thd, expected_error), expected_error,
-            (actual_error ? thd->get_stmt_da()->message_text() : "no error"),
-            actual_error, print_slave_db_safe(db), query_arg);
-        thd->is_slave_error = true;
-      } else {
-        rli->report(
-            INFORMATION_LEVEL, actual_error,
-            "The actual error and expected error on slave are"
-            " different that will result in ER_INCONSISTENT_ERROR but"
-            " that is passed as an argument to replica_skip_errors so no"
-            " error is thrown. "
-            "The expected error was %s with, Error_code: %d. "
-            "The actual error is %s with ",
-            ER_THD_NONCONST(thd, expected_error), expected_error,
-            thd->get_stmt_da()->message_text());
-        clear_all_errors(thd, const_cast<Relay_log_info *>(rli));
-      }
-    }
-    /*
-      If we get the same error code as expected and it is not a concurrency
-      issue, or should be ignored.
-    */
-    else if ((expected_error == actual_error &&
-              !concurrency_error_code(expected_error)) ||
-             ignored_error_code(actual_error)) {
-      DBUG_PRINT("info", ("error ignored"));
-      if (actual_error && ignored_error_code(actual_error)) {
-        if (actual_error == ER_SLAVE_IGNORED_TABLE) {
-          if (!slave_ignored_err_throttle.log())
-            rli->report(INFORMATION_LEVEL, actual_error,
-                        "Could not execute %s event. Detailed error: %s;"
-                        " Error log throttle is enabled. This error will not be"
-                        " displayed for next %lu secs. It will be suppressed",
-                        get_type_str(), thd->get_stmt_da()->message_text(),
-                        (window_size / 1000000));
-        } else
-          rli->report(INFORMATION_LEVEL, actual_error,
-                      "Could not execute %s event. Detailed error: %s;",
-                      get_type_str(), thd->get_stmt_da()->message_text());
-      }
-      has_ddl_committed = false;  // The same comments as above.
-      clear_all_errors(thd, const_cast<Relay_log_info *>(rli));
-      thd->killed = THD::NOT_KILLED;
-    }
-    /*
-      Other cases: mostly we expected no error and get one.
-    */
-    else if (thd->is_slave_error || thd->is_fatal_error()) {
-      if (!is_silent_error(thd)) {
-        rli->report(ERROR_LEVEL, actual_error,
-                    "Error '%s' on query. Default database: '%s'. Query: '%s'",
-                    (actual_error ? thd->get_stmt_da()->message_text()
-                                  : "unexpected success or fatal error"),
-                    print_slave_db_safe(thd->db().str), query_arg);
-      }
-      thd->is_slave_error = true;
-    }
-
-    /*
-      TODO: compare the values of "affected rows" around here. Something
-      like:
-      if ((uint32) affected_in_event != (uint32) affected_on_slave)
-      {
-      sql_print_error("Slave: did not get the expected number of affected "
-      "rows running query from master - expected %d, got %d (this numbers "
-      "should have matched modulo 4294967296).", 0, ...);
-      thd->is_slave_error = 1;
-      }
-      We may also want an option to tell the slave to ignore "affected"
-      mismatch. This mismatch could be implemented with a new ER_ code, and
-      to ignore it you would use --replica-skip-errors...
-
-      To do the comparison we need to know the value of "affected" which the
-      above dispatch_sql_command() computed. And we need to know the value of
-      "affected" in the master's binlog. Both will be implemented later. The
-      important thing is that we now have the format ready to log the values
-      of "affected" in the binlog. So we can release 5.0.0 before effectively
-      logging "affected" and effectively comparing it.
-    */
-  } /* End of if (db_ok(... */
-
-  {
-    /**
-      The following failure injecion works in cooperation with tests
-      setting @@global.debug= 'd,stop_replica_middle_group'.
-      The sql thread receives the killed status and will proceed
-      to shutdown trying to finish incomplete events group.
-    */
-
-    // TODO: address the middle-group killing in MTS case
-
-    DBUG_EXECUTE_IF(
-        "stop_replica_middle_group",
-        if (strcmp("COMMIT", query) != 0 && strcmp("BEGIN", query) != 0) {
-          if (thd->get_transaction()->cannot_safely_rollback(
-                  Transaction_ctx::SESSION))
-            const_cast<Relay_log_info *>(rli)->abort_slave = 1;
-        };);
-  }
 
 end:
 
-  if (thd->temporary_tables) detach_temp_tables_worker(thd, rli);
-  /*
-    Probably we have set thd->query, thd->db, thd->catalog to point to places
-    in the data_buf of this event. Now the event is going to be deleted
-    probably, so data_buf will be freed, so the thd->... listed above will be
-    pointers to freed memory.
-    So we must set them to 0, so that those bad pointers values are not later
-    used. Note that "cleanup" queries like automatic DROP TEMPORARY TABLE
-    don't suffer from these assignments to 0 as DROP TEMPORARY
-    TABLE uses the db.table syntax.
-  */
-  thd->set_catalog(NULL_CSTR);
-  thd->set_db(NULL_CSTR); /* will free the current database */
-  thd->reset_query();
-  thd->lex->sql_command = SQLCOM_END;
-  DBUG_PRINT("info", ("end: query= 0"));
+    if (thd->temporary_tables) detach_temp_tables_worker(thd, rli);
+    /*
+        Probably we have set thd->query, thd->db, thd->catalog to point to places
+        in the data_buf of this event. Now the event is going to be deleted
+        probably, so data_buf will be freed, so the thd->... listed above will be
+        pointers to freed memory.
+        So we must set them to 0, so that those bad pointers values are not later
+        used. Note that "cleanup" queries like automatic DROP TEMPORARY TABLE
+        don't suffer from these assignments to 0 as DROP TEMPORARY
+        TABLE uses the db.table syntax.
+    */
+    thd->set_catalog(NULL_CSTR);
+    thd->set_db(NULL_CSTR); /* will free the current database */
+    thd->reset_query();
+    thd->lex->sql_command = SQLCOM_END;
+    DBUG_PRINT("info", ("end: query= 0"));
 
-  /* Mark the statement completed. */
-  MYSQL_END_STATEMENT(thd->m_statement_psi, thd->get_stmt_da());
+    /* Mark the statement completed. */
+    MYSQL_END_STATEMENT(thd->m_statement_psi, thd->get_stmt_da());
 
-  /* Maintain compatibility with the legacy processlist. */
-  if (pfs_processlist_enabled) thd->reset_query_for_display();
+    /* Maintain compatibility with the legacy processlist. */
+    if (pfs_processlist_enabled) thd->reset_query_for_display();
 
-  thd->reset_rewritten_query();
-  thd->m_statement_psi = nullptr;
-  thd->m_digest = nullptr;
+    thd->reset_rewritten_query();
+    thd->m_statement_psi = nullptr;
+    thd->m_digest = nullptr;
 
-  /*
-    As a disk space optimization, future masters will not log an event for
-    LAST_INSERT_ID() if that function returned 0 (and thus they will be able
-    to replace the THD::stmt_depends_on_first_successful_insert_id_in_prev_stmt
-    variable by (THD->first_successful_insert_id_in_prev_stmt > 0) ; with the
-    resetting below we are ready to support that.
-  */
-  thd->first_successful_insert_id_in_prev_stmt_for_binlog = 0;
-  thd->first_successful_insert_id_in_prev_stmt = 0;
-  thd->stmt_depends_on_first_successful_insert_id_in_prev_stmt = false;
-  free_root(thd->mem_root, MYF(MY_KEEP_PREALLOC));
-  return thd->is_slave_error;
+    /*
+        As a disk space optimization, future masters will not log an event for
+        LAST_INSERT_ID() if that function returned 0 (and thus they will be able
+        to replace the THD::stmt_depends_on_first_successful_insert_id_in_prev_stmt
+        variable by (THD->first_successful_insert_id_in_prev_stmt > 0) ; with the
+        resetting below we are ready to support that.
+    */
+    thd->first_successful_insert_id_in_prev_stmt_for_binlog = 0;
+    thd->first_successful_insert_id_in_prev_stmt = 0;
+    thd->stmt_depends_on_first_successful_insert_id_in_prev_stmt = false;
+    free_root(thd->mem_root, MYF(MY_KEEP_PREALLOC));
+    return thd->is_slave_error;
 }
 
 int Query_log_event::do_update_pos(Relay_log_info *rli) {

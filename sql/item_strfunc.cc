@@ -4018,10 +4018,16 @@ static void tohex(char *to, uint from, uint len) {
   }
 }
 
-static void set_clock_seq_str() {
-  uint16 clock_seq = ((uint)(my_rnd(&uuid_rand) * 16383)) | UUID_VARIANT;
-  tohex(clock_seq_and_node_str + 1, clock_seq, 4);
-  nanoseq = 0;
+/*
+ * 随机生成一个 14bit 的值
+ * 并将最高的 16bit 位置置 1，标识该 UUID 使用 VARIANT 1
+ * 该随机数会填充 clock_seq_and_node_str 的 clock seq 部分
+ */
+static void set_clock_seq_str()
+{
+    uint16 clock_seq = ((uint)(my_rnd(&uuid_rand) * 16383)) | UUID_VARIANT;
+    tohex(clock_seq_and_node_str + 1, clock_seq, 4);
+    nanoseq = 0;
 }
 
 bool Item_func_uuid::resolve_type(THD *) {
@@ -4038,110 +4044,139 @@ bool Item_func_uuid::itemize(Parse_context *pc, Item **res) {
   return false;
 }
 
-String *mysql_generate_uuid(String *str) {
-  char *s;
-  THD *thd = current_thd;
+String*
+mysql_generate_uuid(String* str)
+{
+    char *s;
+    THD *thd = current_thd;
 
-  mysql_mutex_lock(&LOCK_uuid_generator);
-  if (!uuid_time) /* first UUID() call. initializing data */
-  {
-    ulong tmp = sql_rnd_with_mutex();
-    uchar mac[6];
-    int i;
-    if (my_gethwaddr(mac)) {
-      /* purecov: begin inspected */
-      /*
-        generating random "hardware addr"
-        and because specs explicitly specify that it should NOT correlate
-        with a clock_seq value (initialized random below), we use a separate
-        randominit() here
-      */
-      randominit(&uuid_rand, tmp + (ulong)thd,
-                 tmp + (ulong)atomic_global_query_id);
-      for (i = 0; i < (int)sizeof(mac); i++)
-        mac[i] = (uchar)(my_rnd(&uuid_rand) * 255);
-      /* purecov: end */
+    mysql_mutex_lock(&LOCK_uuid_generator);
+    /* first UUID() call. initializing data */
+    // 首次调用时生成 clock_seq_and_node_str
+    if (!uuid_time)
+    {
+        ulong tmp = sql_rnd_with_mutex();   // 生成随机数
+
+        uchar mac[6];
+        int i;
+        if (my_gethwaddr(mac))  // 获取当前机器的 MAC 地址，成功时返回 0
+        {
+            // 若未能获取当前网络设备的 MAC 地址则用一个 clock_seq 无关的随机数
+            /* purecov: begin inspected */
+            /*
+                generating random "hardware addr"
+                and because specs explicitly specify that it should NOT correlate
+                with a clock_seq value (initialized random below), we use a separate
+                randominit() here
+            */
+            randominit(&uuid_rand, tmp + (ulong)thd,
+                        tmp + (ulong)atomic_global_query_id);
+            for (i = 0; i < (int)sizeof(mac); i++)
+                mac[i] = (uchar)(my_rnd(&uuid_rand) * 255);
+            /* purecov: end */
+        }
+
+        // s 置为 clock_seq_and_node_str 的最后一个 byte
+        s = clock_seq_and_node_str + sizeof(clock_seq_and_node_str) - 1;
+        // 逆序遍历 MAC 地址的每一个 byte
+        // MAC 的每一个 byte 映射为 clock_seq_and_node_str 的两个 byte
+        // 填充了 clock_seq_and_node_str 的后 12 个字节(node_str)
+        for (i = sizeof(mac) - 1; i >= 0; i--)
+        {
+            *--s = _dig_vec_lower[mac[i] & 15]; // 取低 4 位
+            *--s = _dig_vec_lower[mac[i] >> 4]; // 取高 4 位
+        }
+        // 生成一个 start time 相关的随机数，填充 clock_seq_and_node_str 的前 4 个字节(clock_seq)
+        randominit(&uuid_rand, tmp + (ulong)server_start_time,
+                   tmp + (ulong)thd->status_var.bytes_sent);
+        set_clock_seq_str();
     }
-    s = clock_seq_and_node_str + sizeof(clock_seq_and_node_str) - 1;
-    for (i = sizeof(mac) - 1; i >= 0; i--) {
-      *--s = _dig_vec_lower[mac[i] & 15];
-      *--s = _dig_vec_lower[mac[i] >> 4];
+
+    // 获取当前的高精度(以 100ns 作为单位)epoch
+    // UUID_TIME_OFFSET 用于将时间起点置为 1970-01-01 00:00:00.00
+    // nanoseq 干啥的不知道
+    ulonglong tv = my_getsystime() + UUID_TIME_OFFSET + nanoseq;
+
+    if (likely(tv > uuid_time))
+    {
+        /*
+         *  Current time is ahead of last timestamp, as it should be.
+         *  If we "borrowed time", give it back, just as long as we
+         *  stay ahead of the previous timestamp.
+         *  当前时间领先于 last timestamp，这是期望出现的场景。
+         *  如果我们之前 “借过时间”，则此时偿还，只要我们保持在领先于前一个时间戳即可。
+         */
+        if (nanoseq)
+        {
+            assert((tv > uuid_time) && (nanoseq > 0));
+            /*
+                -1 so we won't make tv= uuid_time for nanoseq >= (tv - uuid_time)
+            */
+            ulong delta = min<ulong>(nanoseq, (ulong)(tv - uuid_time - 1));
+            tv -= delta;
+            nanoseq -= delta;
+        }
     }
-    randominit(&uuid_rand, tmp + (ulong)server_start_time,
-               tmp + (ulong)thd->status_var.bytes_sent);
-    set_clock_seq_str();
+    else // tv <= uuid_time
+    {
+        if (unlikely(tv == uuid_time))
+        {
+            /*
+                For low-res system clocks. If several requests for UUIDs
+                end up on the same tick, we add a nano-second to make them
+                different.
+                ( current_timestamp + nanoseq * calls_in_this_period )
+                may end up > next_timestamp; this is OK. Nonetheless, we'll
+                try to unwind nanoseq when we get a chance to.
+                If nanoseq overflows, we'll start over with a new numberspace
+                (so the if() below is needed so we can avoid the ++tv and thus
+                match the follow-up if() if nanoseq overflows!).
+            */
+            if (likely(++nanoseq)) ++tv;
+        }
+
+        if (unlikely(tv <= uuid_time))
+        {
+            /*
+                If the admin changes the system clock (or due to Daylight
+                Saving Time), the system clock may be turned *back* so we
+                go through a period once more for which we already gave out
+                UUIDs.  To avoid duplicate UUIDs despite potentially identical
+                times, we make a new random component.
+                We also come here if the nanoseq "borrowing" overflows.
+                In either case, we throw away any nanoseq borrowing since it's
+                irrelevant in the new numberspace.
+            */
+            set_clock_seq_str();
+            tv = my_getsystime() + UUID_TIME_OFFSET;
+            nanoseq = 0;
+            DBUG_PRINT("uuid", ("making new numberspace"));
+        }
   }
 
-  ulonglong tv = my_getsystime() + UUID_TIME_OFFSET + nanoseq;
+    uuid_time = tv;
+    mysql_mutex_unlock(&LOCK_uuid_generator);
 
-  if (likely(tv > uuid_time)) {
-    /*
-      Current time is ahead of last timestamp, as it should be.
-      If we "borrowed time", give it back, just as long as we
-      stay ahead of the previous timestamp.
-    */
-    if (nanoseq) {
-      assert((tv > uuid_time) && (nanoseq > 0));
-      /*
-        -1 so we won't make tv= uuid_time for nanoseq >= (tv - uuid_time)
-      */
-      ulong delta = min<ulong>(nanoseq, (ulong)(tv - uuid_time - 1));
-      tv -= delta;
-      nanoseq -= delta;
-    }
-  } else {
-    if (unlikely(tv == uuid_time)) {
-      /*
-        For low-res system clocks. If several requests for UUIDs
-        end up on the same tick, we add a nano-second to make them
-        different.
-        ( current_timestamp + nanoseq * calls_in_this_period )
-        may end up > next_timestamp; this is OK. Nonetheless, we'll
-        try to unwind nanoseq when we get a chance to.
-        If nanoseq overflows, we'll start over with a new numberspace
-        (so the if() below is needed so we can avoid the ++tv and thus
-        match the follow-up if() if nanoseq overflows!).
-      */
-      if (likely(++nanoseq)) ++tv;
-    }
+    // time_low 为时间的 0-31 bit
+    uint32 time_low = (uint32)(tv & 0xFFFFFFFF);
+    // time_low 为时间的 32-47 bit
+    uint16 time_mid = (uint16)((tv >> 32) & 0xFFFF);
+    // time_low 为时间的 48-63 bit
+    // 并对 0x1000 置 1，标识使用 UUID VERSION 1
+    uint16 time_hi_and_version = (uint16)((tv >> 48) | UUID_VERSION);
 
-    if (unlikely(tv <= uuid_time)) {
-      /*
-        If the admin changes the system clock (or due to Daylight
-        Saving Time), the system clock may be turned *back* so we
-        go through a period once more for which we already gave out
-        UUIDs.  To avoid duplicate UUIDs despite potentially identical
-        times, we make a new random component.
-        We also come here if the nanoseq "borrowing" overflows.
-        In either case, we throw away any nanoseq borrowing since it's
-        irrelevant in the new numberspace.
-      */
-      set_clock_seq_str();
-      tv = my_getsystime() + UUID_TIME_OFFSET;
-      nanoseq = 0;
-      DBUG_PRINT("uuid", ("making new numberspace"));
-    }
-  }
-
-  uuid_time = tv;
-  mysql_mutex_unlock(&LOCK_uuid_generator);
-
-  uint32 time_low = (uint32)(tv & 0xFFFFFFFF);
-  uint16 time_mid = (uint16)((tv >> 32) & 0xFFFF);
-  uint16 time_hi_and_version = (uint16)((tv >> 48) | UUID_VERSION);
-
-  str->mem_realloc(UUID_LENGTH + 1);
-  str->length(UUID_LENGTH);
-  str->set_charset(system_charset_info);
-  s = str->ptr();
-  s[8] = s[13] = '-';
-  tohex(s, time_low, 8);
-  tohex(s + 9, time_mid, 4);
-  tohex(s + 14, time_hi_and_version, 4);
-  my_stpcpy(s + 18, clock_seq_and_node_str);
-  DBUG_EXECUTE_IF("force_fake_uuid",
-                  my_stpcpy(s, "a2d00942-b69c-11e4-a696-0020ff6fcbe6"););
-  return str;
+    str->mem_realloc(UUID_LENGTH + 1);
+    str->length(UUID_LENGTH);
+    str->set_charset(system_charset_info);
+    s = str->ptr();
+    s[8] = s[13] = '-';
+    tohex(s, time_low, 8);
+    tohex(s + 9, time_mid, 4);
+    tohex(s + 14, time_hi_and_version, 4);
+    my_stpcpy(s + 18, clock_seq_and_node_str);
+    DBUG_EXECUTE_IF("force_fake_uuid",
+                    my_stpcpy(s, "a2d00942-b69c-11e4-a696-0020ff6fcbe6"););
+    return str;
 }
 
 String *Item_func_uuid::val_str(String *str) {

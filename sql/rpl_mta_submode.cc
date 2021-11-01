@@ -1076,8 +1076,9 @@ Mts_submode_logical_clock::wait_for_workers_to_finish(
 					old_stage, __func__, __FILE__, __LINE__);
 	while (delegated_jobs > jobs_done && !thd->killed && !is_error)
 	{
-		// Todo: consider to replace with a. GAQ::get_lwm_timestamp() or
-		// b. (better) pthread wait+signal similarly to DB type.
+		// Todo: consider to replace with
+		// - a. GAQ::get_lwm_timestamp() or
+		// - b. (better) pthread wait+signal similarly to DB type.
 		if (mta_checkpoint_routine(rli, true)) return -1;
 	}
 
